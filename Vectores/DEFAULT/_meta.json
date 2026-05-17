@@ -1,0 +1,25 @@
+{
+  "created_at": "2026-02-25T14:19:57",
+  "vector_set": "DEFAULT",
+  "seg_path": "C:\\Users\\fabio\\Desktop\\union seg mesh\\seg_256_piel.seg",
+  "meshtal_path": "C:\\Users\\fabio\\Desktop\\union seg mesh\\rat_spnd.msh",
+  "voxel_size_mm": [
+    0.78125,
+    0.3325,
+    0.3325
+  ],
+  "origin_mesh_cm": [
+    230.0,
+    -2.25,
+    -5.0
+  ],
+  "factor_spnd": 3.6006e-09,
+  "tallies": [
+    14,
+    24,
+    34,
+    44
+  ],
+  "tally_overlay": 14,
+  "fix_geom": true
+}
