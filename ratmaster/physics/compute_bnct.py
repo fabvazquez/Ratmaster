@@ -167,8 +167,7 @@ def compute_bnct(
     # ── Incertidumbres globales (escalares, mismas para todos los vóxeles) ───
     #
     # eps_S: incertidumbre RELATIVA del SPND = sigma_spnd / spnd_value.
-    # spnd_error se recibe como valor ABSOLUTO [n/(cm²·s)] (convenio del caller).
-    # La división por spnd_value se realiza aquí (en physics), no en la UI.
+    # spnd_error se recibe como valor ABSOLUTO [n/(cm²·s)].
     eps_S = (
         abs(float(spnd_error)) / abs(float(spnd_value))
         if float(spnd_value) != 0
@@ -183,7 +182,7 @@ def compute_bnct(
         else 0.0
     )
 
-    # eps_sys: error sistemático adicional (fracción relativa).
+    # eps_sys: error sistemático adicional (fracción relativa) Actualmente es 0 por default.
     eps_sys = abs(float(sys_error)) if sys_error else 0.0
 
     # ── Función interna: tasa de dosis por vóxel ────────────────────────────

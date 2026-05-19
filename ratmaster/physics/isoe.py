@@ -61,7 +61,7 @@ _BIEXP_PS_LOWLET:  float = 0.62
 _BIEXP_PF_HIGHLET: float = 0.20      # fracción rápida Boro, Thn, Fstn
 _BIEXP_PS_HIGHLET: float = 0.80
 
-# Nombres amigables para la UI
+# Nombres para la UI
 REPAIR_MODEL_LABELS: dict[str, str] = {
     "monoexp": "Único tiempo de reparación",
     "biexp":   "Múltiples tiempos de reparación",
@@ -86,7 +86,7 @@ TISSUE_CATEGORIES: dict[str, dict] = {
     "spinal_cord": {
         "label":       "Médula espinal",
         "description": "Médula espinal (modelo tardío de SNC).",
-        "organ_hints": ["spinalcord", "medulaespinal", "cordaespinal", "spinal"],
+        "organ_hints": ["spinalcord", "medulaespinal", "cordaespinal", "spinal","medula"],
         "color":       "#1565C0",
     },
     "skin": {
@@ -113,7 +113,7 @@ TISSUE_CATEGORIES: dict[str, dict] = {
 PARAM_DESCRIPTIONS: dict[str, tuple[str, str, str]] = {
     "aR": ("α_R", "Gy⁻¹",
            "Componente LINEAL de la curva de supervivencia de la RADIACIÓN DE "
-           "REFERENCIA (fotones de megavoltaje). Daño celular por un único evento "
+           "REFERENCIA (fotones). Daño celular por un único evento "
            "ionizante, irreparable entre fracciones."),
     "bR": ("β_R", "Gy⁻²",
            "Componente CUADRÁTICA de la referencia. Daño por interacción de dos "
@@ -140,10 +140,10 @@ PARAM_DESCRIPTIONS: dict[str, tuple[str, str, str]] = {
     "bTh": ("β_Thn", "Gy⁻²",
             "Componente cuadrática para neutrones térmicos. Approx.: bTh = bFn."),
     "aG": ("α_Gamma", "Gy⁻¹",
-           "Componente lineal para FOTONES GAMMA del haz BNCT. Baja LET. "
+           "Componente lineal para FOTONES GAMMA. Baja LET. "
            "Approx. estándar: aG = aR."),
     "bG": ("β_Gamma", "Gy⁻²",
-           "Componente cuadrática para gamma del haz. Approx.: bG = bR."),
+           "Componente cuadrática para gamma. Approx.: bG = bR."),
 }
 
 DEFAULT_T0_MAP: dict[str, float] = {

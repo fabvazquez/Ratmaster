@@ -134,3 +134,25 @@ def tcp_stats(
         "D_mean_Gy":  float(np.mean(A)),
         "D_D95_Gy":   float(np.percentile(A, 5)),  # D95 = percentil 5 del DVH inverso
     }
+
+
+def tcp_dose_curve(
+    dose_Gy: np.ndarray,
+    aR: float,
+    bR: float,
+    GR: float,
+    N0: float,
+) -> np.ndarray:
+    """
+    TCP como función de dosis uniforme D [Gy] — curva dosis-respuesta de la literatura.
+
+    Asume que todos los vóxeles reciben exactamente D Gy (irradiación uniforme).
+    Esta es la curva teórica en S que se muestra en publicaciones de radiobiología.
+    El punto del plan real se marca aparte con la D_media actual.
+
+    Returns:
+        Array de TCP ∈ [0,1] para cada dosis en dose_Gy.
+    """
+    d = np.asarray(dose_Gy, float)
+    S = np.exp(-float(aR) * d - float(GR) * float(bR) * d * d)
+    return np.exp(-np.clip(float(N0) * S, 0.0, 700.0))

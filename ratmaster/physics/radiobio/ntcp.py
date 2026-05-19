@@ -143,3 +143,21 @@ def ntcp_curve(
         fn(np.asarray(A_arr) * s, TD50, m, n)
         for s in dose_scales
     ])
+
+def ntcp_dose_curve(
+    dose_Gy: np.ndarray,
+    TD50: float,
+    m: float,
+) -> np.ndarray:
+    """
+    NTCP LKB como función de dosis uniforme D [Gy] — curva dosis-respuesta estándar.
+
+    Asume gEUD = D (irradiación uniforme). Es la curva sigmoide que se ve en
+    la literatura cuando se grafica NTCP vs. dosis acumulada.
+
+    Returns:
+        Array de NTCP ∈ [0,1] para cada dosis en dose_Gy.
+    """
+    d  = np.asarray(dose_Gy, float)
+    t  = (d - float(TD50)) / (float(m) * float(TD50))
+    return ndtr(t)
