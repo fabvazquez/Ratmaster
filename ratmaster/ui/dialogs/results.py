@@ -51,6 +51,48 @@ except ImportError:
     RADIOBIO_OK = False
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: copiar tabla como TSV para pegar en Excel
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _install_copy_shortcut(table: QtWidgets.QTableWidget) -> None:
+    """
+    Instala Ctrl+C en una QTableWidget para copiar las celdas seleccionadas
+    como texto tabulado (TSV), compatible con pegar directamente en Excel.
+    Cada fila termina con \\n y las columnas se separan con \\t.
+    """
+    table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+
+    def _copy():
+        indexes = table.selectedIndexes()
+        if not indexes:
+            return
+        rows = sorted({idx.row() for idx in indexes})
+        cols = sorted({idx.column() for idx in indexes})
+        lines = []
+        for r in rows:
+            row_data = []
+            for c in cols:
+                item = table.item(r, c)
+                row_data.append(item.text() if item else "")
+            lines.append("\t".join(row_data))
+        QtWidgets.QApplication.clipboard().setText("\n".join(lines))
+
+    shortcut = QtGui.QShortcut(QtGui.QKeySequence.Copy, table)
+    shortcut.setContext(QtCore.Qt.WidgetShortcut)
+    shortcut.activated.connect(_copy)
+
+
+def _selectable_label(text: str) -> QtWidgets.QLabel:
+    """Crea un QLabel cuyo texto puede seleccionarse y copiarse con el mouse."""
+    lbl = QtWidgets.QLabel(text)
+    lbl.setTextInteractionFlags(
+        QtCore.Qt.TextSelectableByMouse | QtCore.Qt.TextSelectableByKeyboard
+    )
+    lbl.setCursor(QtGui.QCursor(QtCore.Qt.IBeamCursor))
+    return lbl
+
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # MeshSegViewerDialog — visor interactivo de alineación SEG ↔ Mesh MCNP
@@ -1125,7 +1167,7 @@ class CalculationParamsDialog(QtWidgets.QDialog):
         except Exception:
             date_str = date_raw or "—"
 
-        modo_str = "Constraints" if meta.get("mode") == "constraints" else "Tiempo fijo"
+        modo_str = "Restricción de dosis" if meta.get("mode") == "constraints" else "Tiempo fijo"
         t     = meta.get("time", 0)
         t_err = meta.get("time_err", 0)
         spnd  = meta.get("spnd", 0)
@@ -1146,7 +1188,7 @@ class CalculationParamsDialog(QtWidgets.QDialog):
         if corr is not None:
             pairs1.append(("Factor de corrección (Corr)", f"{corr:.6g}"))
         if meta.get("dose_for_limits"):
-            pairs1.append(("Dosis usada para constraints",
+            pairs1.append(("Dosis usada para restricciones",
                            "Biológica" if meta["dose_for_limits"] == "bio"
                            else "Física"))
         _form(gl1, pairs1)
@@ -1204,7 +1246,7 @@ class CalculationParamsDialog(QtWidgets.QDialog):
                 ach = ch.get("achieved_value")
                 ach_txt = f"{float(ach):.4g} {unit}" if ach is not None else "—"
                 note = QtWidgets.QLabel(
-                    f"<b>Constraint limitante:</b> {ch.get('org','?')} — "
+                    f"<b>Restricción limitante:</b> {ch.get('org','?')} — "
                     f"{ch.get('type','?')}  |  "
                     f"Límite: {ch.get('limit_value','?')} {unit}  |  "
                     f"Logrado: {ach_txt}"
@@ -1340,7 +1382,7 @@ class ComponentDosesDialog(QtWidgets.QDialog):
             ("Thn",   "Dosis Neutrones Térmicos"),
             ("Gamma", "Dosis Gamma"),
         ]
-        SUB_COLS  = ["Dosis Mínima", "Dosis Media", "Dosis Máxima"]
+        SUB_COLS  = ["Dosis Promedio", "Dosis Mínima", "Dosis Máxima"]
         organs    = sorted(comp_data.keys())
         n_sub     = len(SUB_COLS)          # 3
         n_comps   = len(COMPS)             # 4
@@ -1449,7 +1491,7 @@ class ComponentDosesDialog(QtWidgets.QDialog):
                     dmax  = float(np.nanmax(arr))
                 else:
                     dmin = dmean = dmax = 0.0
-                for val in (dmin, dmean, dmax):
+                for val in (dmean, dmin, dmax):   # orden: Promedio, Mínima, Máxima
                     tbl.setItem(row, col, _data(f"{val:.4f}", bg=bg))
                     col += 1
 
@@ -1460,11 +1502,12 @@ class ComponentDosesDialog(QtWidgets.QDialog):
                 t_max  = float(np.nanmax(total))
             else:
                 t_min = t_mean = t_max = 0.0
-            for val in (t_min, t_mean, t_max):
+            for val in (t_mean, t_min, t_max):   # orden: Promedio, Mínima, Máxima
                 tbl.setItem(row, col, _data(f"{val:.4f}", bg=bg))
                 col += 1
 
         tbl.resizeColumnsToContents()
+        _install_copy_shortcut(tbl)
         layout.addWidget(tbl)
 
         btn_close = QtWidgets.QPushButton("Cerrar")
@@ -1506,16 +1549,16 @@ class ResultsDialog(QtWidgets.QDialog):
             ch = meta.get("chosen_constraint")
             if ch:
                 ach = ch.get('achieved_value', 0.0)
-                s += f" &nbsp;&nbsp; <b>Constraint limitante:</b> {ch.get('org','?')} - {ch.get('type','?')} (límite {ch.get('limit_value','?')} {unit}, logrado {float(ach):.3f} {unit})"
+                s += f" &nbsp;&nbsp; <b>Restricción limitante:</b> {ch.get('org','?')} - {ch.get('type','?')} (límite {ch.get('limit_value','?')} {unit}, logrado {float(ach):.3f} {unit})"
         hdr.setText(s)
         layout.addWidget(hdr)
 
-        # parámetros
+        # parámetros (valores seleccionables con el mouse)
         pbox = QtWidgets.QGroupBox("Parámetros")
         form = QtWidgets.QFormLayout(pbox)
-        form.addRow("Protocolo de boro:", QtWidgets.QLabel(_resolve_boro_protocol_name(meta.get("boro_protocol_name", "Manual"))))
-        form.addRow("Flujo neutrónico (n/cm\u00b2·s):", QtWidgets.QLabel(format_scientific_value_uncertainty(meta.get("spnd",0), meta.get("spnd_abs_err",0), "n/cm²·s")))
-        form.addRow("Tiempo:", QtWidgets.QLabel(format_value_uncertainty(meta.get("time",0), meta.get("time_err",0), "s")))
+        form.addRow("Protocolo de boro:", _selectable_label(_resolve_boro_protocol_name(meta.get("boro_protocol_name", "Manual"))))
+        form.addRow("Flujo neutrónico (n/cm\u00b2·s):", _selectable_label(format_scientific_value_uncertainty(meta.get("spnd",0), meta.get("spnd_abs_err",0), "n/cm²·s")))
+        form.addRow("Tiempo:", _selectable_label(format_value_uncertainty(meta.get("time",0), meta.get("time_err",0), "s")))
         layout.addWidget(pbox)
 
         # tabla de resultados (según modo)
@@ -1524,7 +1567,8 @@ class ResultsDialog(QtWidgets.QDialog):
         table.setShowGrid(True)
         table.verticalHeader().setVisible(False)
         keys = sorted(self.dsum.keys())
-        cols = ["Órgano","Dmax","±","Dmin","±","Dmean","±","D95","±","D5","±",]
+        # Columnas: Órgano | Dosis Promedio ± | Dosis Mínima ± | Dosis Máxima ± | D95 ± | D5 ±
+        cols = ["Órgano", "Dosis Promedio", "±", "Dosis Mínima", "±", "Dosis Máxima", "±", "D95", "±", "D5", "±"]
         table.setColumnCount(len(cols))
         table.setRowCount(len(keys))
         table.setHorizontalHeaderLabels(cols)
@@ -1535,17 +1579,19 @@ class ResultsDialog(QtWidgets.QDialog):
                 item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
                 return item
             table.setItem(i,0, it(k))
-            table.setItem(i,1, it(f"{v['Dmax']:.2f}"))
-            table.setItem(i,2, it(f"{v['Sigma_Dmax']:.2f}"))
+            # Orden: Promedio, Mínima, Máxima, D95, D5
+            table.setItem(i,1, it(f"{v['Dmean']:.2f}"))
+            table.setItem(i,2, it(f"{v['Sigma_Dmean']:.2f}"))
             table.setItem(i,3, it(f"{v['Dmin']:.2f}"))
             table.setItem(i,4, it(f"{v['Sigma_Dmin']:.2f}"))
-            table.setItem(i,5, it(f"{v['Dmean']:.2f}"))
-            table.setItem(i,6, it(f"{v['Sigma_Dmean']:.2f}"))
+            table.setItem(i,5, it(f"{v['Dmax']:.2f}"))
+            table.setItem(i,6, it(f"{v['Sigma_Dmax']:.2f}"))
             table.setItem(i,7, it(f"{v['D95']:.2f}"))
             table.setItem(i,8, it(f"{v['Sigma_D95']:.2f}"))
             table.setItem(i,9, it(f"{v['D5']:.2f}"))
             table.setItem(i,10,it(f"{v['Sigma_D5']:.2f}"))
         table.resizeColumnsToContents()
+        _install_copy_shortcut(table)
         layout.addWidget(table)
 
         # DVH en este diálogo
@@ -1579,12 +1625,26 @@ class ResultsDialog(QtWidgets.QDialog):
 
         # botones
         h = QtWidgets.QHBoxLayout()
-        self.btn_pdf    = QtWidgets.QPushButton("Exportar PDF")
+
+        # Botón "Exportar resultados" con menú desplegable (PDF / Excel / Ambos)
+        self.btn_export = QtWidgets.QPushButton("Exportar resultados ▾")
+        self.btn_export.setStyleSheet("QPushButton::menu-indicator { image: none; }")
+        self.btn_export.setToolTip(
+            "PDF: reporte dosimétrico completo.\n"
+            "Excel: tablas de métricas y componentes + parámetros del cálculo.\n"
+            "PDF + Excel: genera ambos archivos."
+        )
+        _export_menu = QtWidgets.QMenu(self.btn_export)
+        self._act_pdf   = _export_menu.addAction("Exportar PDF")
+        self._act_xlsx  = _export_menu.addAction("Exportar Excel (.xlsx)")
+        self._act_both  = _export_menu.addAction("Exportar PDF + Excel")
+        self.btn_export.setMenu(_export_menu)
+
         self.btn_comp   = QtWidgets.QPushButton("Componentes de Dosis")
         self.btn_comp.setToolTip("Muestra la tabla de componentes: Boro, Neutrones Rápidos, Térmicos y Gamma por órgano")
         self.btn_params = QtWidgets.QPushButton("Parámetros del cálculo")
-        self.btn_params.setToolTip("Muestra todos los parámetros usados: boro, CBE/RBE, SPND, constraints, IsoE")
-        self.btn_viz    = QtWidgets.QPushButton("🗺  Visualizar Dosis")
+        self.btn_params.setToolTip("Muestra todos los parámetros usados: boro, CBE/RBE, SPND, restricciones, IsoE")
+        self.btn_viz    = QtWidgets.QPushButton("Visualizar Dosis")
         self.btn_viz.setToolTip(
             "Abre el visor 2D de mapas de dosis por órgano superpuestos a la segmentación.\n"
             "Requiere que se hayan cargado datos espaciales (build_viz_data)."
@@ -1601,7 +1661,7 @@ class ResultsDialog(QtWidgets.QDialog):
                 "Llamá a build_viz_data() y pasá el resultado como viz_data al constructor."
             )
 
-        self.btn_radiobio = QtWidgets.QPushButton("📊  Prob. Dosis-Efecto")
+        self.btn_radiobio = QtWidgets.QPushButton("Prob. Dosis-Efecto")
         self.btn_radiobio.setToolTip(
             "Calcula TCP, NTCP y supervivencia celular a partir de la dosis isoefectiva.\n"
             "Requiere modo IsoE activo."
@@ -1616,7 +1676,7 @@ class ResultsDialog(QtWidgets.QDialog):
             self.btn_radiobio.setToolTip(tip)
 
         self.btn_close  = QtWidgets.QPushButton("Cerrar")
-        h.addWidget(self.btn_pdf)
+        h.addWidget(self.btn_export)
         h.addWidget(self.btn_comp)
         h.addWidget(self.btn_params)
         h.addWidget(self.btn_viz)
@@ -1626,7 +1686,9 @@ class ResultsDialog(QtWidgets.QDialog):
         layout.addLayout(h)
 
         self.btn_close.clicked.connect(self.accept)
-        self.btn_pdf.clicked.connect(self._export_pdf)
+        self._act_pdf.triggered.connect(self._export_pdf)
+        self._act_xlsx.triggered.connect(self._export_xlsx)
+        self._act_both.triggered.connect(self._export_both)
         self.btn_comp.clicked.connect(self._open_comp_doses)
         self.btn_params.clicked.connect(self._open_calc_params)
         self.btn_viz.clicked.connect(self._open_dose_viewer)
@@ -1700,15 +1762,255 @@ class ResultsDialog(QtWidgets.QDialog):
                 if key and key in dm:
                     ach = dm.get(key)
             if ach is None:
-                return f" &nbsp;&nbsp; <b>Constraint limitante:</b> {org} - {typ} (límite {lim})"
+                return f" &nbsp;&nbsp; <b>Restricción limitante:</b> {org} - {typ} (límite {lim})"
             else:
                 try:
                     ach_val = float(ach)
-                    return f" &nbsp;&nbsp; <b>Constraint limitante:</b> {org} - {typ} (límite {lim}, logrado {ach_val:.3f})"
+                    return f" &nbsp;&nbsp; <b>Restricción limitante:</b> {org} - {typ} (límite {lim}, logrado {ach_val:.3f})"
                 except Exception:
-                    return f" &nbsp;&nbsp; <b>Constraint limitante:</b> {org} - {typ} (límite {lim}, logrado {ach})"
+                    return f" &nbsp;&nbsp; <b>Restricción limitante:</b> {org} - {typ} (límite {lim}, logrado {ach})"
         except Exception:
             return ""
+    def _export_both(self):
+        """Exporta PDF y Excel en secuencia."""
+        self._export_pdf()
+        self._export_xlsx()
+
+    def _export_xlsx(self):
+        """Exporta un archivo Excel (.xlsx) con métricas, componentes y parámetros."""
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            QtWidgets.QMessageBox.warning(
+                self, "Excel no disponible",
+                "Instalá openpyxl para exportar Excel:\n  pip install openpyxl"
+            )
+            return
+
+        sugerido = Path.home() / (
+            "resultados_ratmaster_" + datetime.now().strftime("%Y%m%dT%H%M%S") + ".xlsx"
+        )
+        fname, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Guardar Excel", str(sugerido), "Excel (*.xlsx)"
+        )
+        if not fname:
+            return
+
+        wb = openpyxl.Workbook()
+
+        # ── Estilos ──────────────────────────────────────────────────────────
+        hdr_fill  = PatternFill("solid", fgColor="455A64")
+        hdr_font  = Font(bold=True, color="FFFFFF")
+        hdr2_fill = PatternFill("solid", fgColor="607D8B")
+        hdr2_font = Font(bold=True, color="FFFFFF")
+        meta_fill = PatternFill("solid", fgColor="F0F0F0")
+        thin      = Side(style="thin", color="CFD8DC")
+        border    = Border(left=thin, right=thin, top=thin, bottom=thin)
+        center    = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        right_al  = Alignment(horizontal="right", vertical="center")
+        left_al   = Alignment(horizontal="left",  vertical="center")
+
+        def _hdr_cell(ws, row, col, text, fill=None, font=None):
+            c = ws.cell(row=row, column=col, value=text)
+            c.fill = fill or hdr_fill
+            c.font = font or hdr_font
+            c.alignment = center
+            c.border = border
+            return c
+
+        def _data_cell(ws, row, col, value, align=None):
+            c = ws.cell(row=row, column=col, value=value)
+            c.border = border
+            c.alignment = align or right_al
+            return c
+
+        meta  = self.report.get("meta", {}) or {}
+        unit  = dose_axis_unit(self.use_bio, self.is_isoe)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # HOJA 1: Parámetros del cálculo
+        # ═══════════════════════════════════════════════════════════════════
+        ws_meta = wb.active
+        ws_meta.title = "Parámetros"
+
+        ws_meta.column_dimensions["A"].width = 32
+        ws_meta.column_dimensions["B"].width = 42
+
+        _hdr_cell(ws_meta, 1, 1, "Parámetros del cálculo")
+        ws_meta.merge_cells("A1:B1")
+
+        # Fecha
+        date_raw = meta.get("date", "")
+        try:
+            from datetime import timezone as _tz
+            _dt = datetime.fromisoformat(date_raw).astimezone()
+            date_str = _dt.strftime("%d/%m/%Y  %H:%M:%S")
+        except Exception:
+            date_str = date_raw or "—"
+
+        modo_str = "Restricciones de dosis" if meta.get("mode") == "constraints" else "Tiempo fijo"
+
+        pairs = [
+            ("Fecha / hora",              date_str),
+            ("Tipo de dosis",             self.dose_mode_text),
+            ("Modo de cálculo",           modo_str),
+            ("Protocolo de boro",         _resolve_boro_protocol_name(meta.get("boro_protocol_name", "Manual"))),
+            ("Tiempo de irradiación",     format_value_uncertainty(meta.get("time", 0), meta.get("time_err", 0), "s")),
+            ("Flujo neutrónico (n/cm²·s)",format_scientific_value_uncertainty(meta.get("spnd", 0), meta.get("spnd_abs_err", 0), "n/cm²·s")),
+        ]
+
+        # Constraint limitante
+        if meta.get("mode") == "constraints" and meta.get("chosen_constraint"):
+            ch = meta["chosen_constraint"]
+            ach = ch.get("achieved_value")
+            ach_txt = f"{float(ach):.3f} {unit}" if ach is not None else "—"
+            pairs.append(("Restricción limitante",
+                          f"{ch.get('org','?')} — {ch.get('type','?')} "
+                          f"(límite {ch.get('limit_value','?')} {unit}, logrado {ach_txt})"))
+
+        for ridx, (label, value) in enumerate(pairs, start=2):
+            c_lbl = ws_meta.cell(row=ridx, column=1, value=label)
+            c_lbl.fill = meta_fill
+            c_lbl.font = Font(bold=True)
+            c_lbl.border = border
+            c_lbl.alignment = left_al
+            c_val = ws_meta.cell(row=ridx, column=2, value=value)
+            c_val.border = border
+            c_val.alignment = left_al
+
+        # ═══════════════════════════════════════════════════════════════════
+        # HOJA 2: Métricas de dosis
+        # ═══════════════════════════════════════════════════════════════════
+        ws_res = wb.create_sheet("Métricas de dosis")
+
+        col_widths = [18, 14, 10, 14, 10, 14, 10, 12, 10, 12, 10]
+        for ci, w in enumerate(col_widths, start=1):
+            ws_res.column_dimensions[get_column_letter(ci)].width = w
+
+        head_mode = (
+            "Dosis Isoefectiva — Gy(IsoE)" if self.is_isoe
+            else ("Dosis Equivalente RBE — Gy(RBE)" if self.use_bio else "Dosis Física — Gy")
+        )
+        _hdr_cell(ws_res, 1, 1, head_mode)
+        ws_res.merge_cells(f"A1:{get_column_letter(len(col_widths))}1")
+
+        hdr_cols = [
+            "Órgano",
+            f"Dosis Promedio ({unit})", "± σ",
+            f"Dosis Mínima ({unit})", "± σ",
+            f"Dosis Máxima ({unit})", "± σ",
+            "D95", "± σ",
+            "D5",  "± σ",
+        ]
+        for ci, h_txt in enumerate(hdr_cols, start=1):
+            _hdr_cell(ws_res, 2, ci, h_txt, fill=hdr2_fill, font=hdr2_font)
+
+        for ridx, key in enumerate(sorted(self.dsum.keys()), start=3):
+            v = self.dsum[key]
+            fill_row = PatternFill("solid", fgColor="F5F7FA" if ridx % 2 == 0 else "FFFFFF")
+            vals = [
+                key,
+                round(v["Dmean"], 4),       round(v["Sigma_Dmean"], 4),
+                round(v["Dmin"],  4),       round(v["Sigma_Dmin"],  4),
+                round(v["Dmax"],  4),       round(v["Sigma_Dmax"],  4),
+                round(v["D95"],   4),       round(v["Sigma_D95"],   4),
+                round(v["D5"],    4),       round(v["Sigma_D5"],    4),
+            ]
+            for ci, val in enumerate(vals, start=1):
+                c = ws_res.cell(row=ridx, column=ci, value=val)
+                c.fill = fill_row
+                c.border = border
+                c.alignment = left_al if ci == 1 else right_al
+
+        # ═══════════════════════════════════════════════════════════════════
+        # HOJA 3: Componentes de dosis
+        # ═══════════════════════════════════════════════════════════════════
+        comp_data = self.report.get("CompDoses", {})
+        if comp_data:
+            ws_comp = wb.create_sheet("Componentes de dosis")
+            COMPS_XL = [
+                ("Boro",  "Boro"),
+                ("Fstn",  "Neut. Rápidos"),
+                ("Thn",   "Neut. Térmicos"),
+                ("Gamma", "Gamma"),
+            ]
+            SUB_XL = ["Promedio", "Mínima", "Máxima"]
+
+            # Fila 1: título
+            total_cols = 1 + len(COMPS_XL) * 3 + 3
+            _hdr_cell(ws_comp, 1, 1, "Componentes de Dosis por Órgano (Dosis Física, sin RBE/CBE)")
+            ws_comp.merge_cells(f"A1:{get_column_letter(total_cols)}1")
+
+            # Fila 2: títulos de grupo
+            ws_comp.column_dimensions["A"].width = 18
+            ws_comp.cell(row=2, column=1, value="Órgano").font = hdr_font
+            ws_comp.cell(row=2, column=1).fill = hdr_fill
+            ws_comp.cell(row=2, column=1).border = border
+            ws_comp.cell(row=2, column=1).alignment = center
+            ws_comp.merge_cells(f"A2:A3")
+
+            for gi, (_, label) in enumerate(COMPS_XL):
+                sc = 2 + gi * 3
+                _hdr_cell(ws_comp, 2, sc, label)
+                ws_comp.merge_cells(
+                    f"{get_column_letter(sc)}2:{get_column_letter(sc+2)}2"
+                )
+
+            # Total
+            tc = 2 + len(COMPS_XL) * 3
+            _hdr_cell(ws_comp, 2, tc, "Total")
+            ws_comp.merge_cells(
+                f"{get_column_letter(tc)}2:{get_column_letter(tc+2)}2"
+            )
+
+            # Fila 3: sub-columnas
+            for gi in range(len(COMPS_XL) + 1):
+                for si, s_lbl in enumerate(SUB_XL):
+                    cc = 2 + gi * 3 + si
+                    _hdr_cell(ws_comp, 3, cc, s_lbl, fill=hdr2_fill, font=hdr2_font)
+
+            for ridx, organ in enumerate(sorted(comp_data.keys()), start=4):
+                cd = comp_data[organ]
+                fill_row = PatternFill("solid", fgColor="F5F7FA" if ridx % 2 == 0 else "FFFFFF")
+                c = ws_comp.cell(row=ridx, column=1, value=organ)
+                c.fill = fill_row; c.border = border; c.alignment = left_al
+
+                col_idx = 2
+                arrays = {}
+                for comp_key, _ in COMPS_XL:
+                    arr = np.array(cd.get(comp_key, []), dtype=float)
+                    arrays[comp_key] = arr[np.isfinite(arr)]
+
+                valid = [arrays[k] for k in arrays if arrays[k].size > 0]
+                ref_size = valid[0].size if valid else 1
+                total_arr = np.zeros(ref_size)
+                for arr in valid:
+                    n = min(arr.size, ref_size)
+                    total_arr[:n] += arr[:n]
+
+                for comp_key, _ in COMPS_XL:
+                    arr = arrays[comp_key]
+                    if arr.size > 0:
+                        vals_c = (float(np.nanmean(arr)), float(np.nanmin(arr)), float(np.nanmax(arr)))
+                    else:
+                        vals_c = (0.0, 0.0, 0.0)
+                    for val in vals_c:
+                        cx = ws_comp.cell(row=ridx, column=col_idx, value=round(val, 4))
+                        cx.fill = fill_row; cx.border = border; cx.alignment = right_al
+                        col_idx += 1
+
+                # Total
+                t_vals = (float(np.nanmean(total_arr)), float(np.nanmin(total_arr)), float(np.nanmax(total_arr)))
+                for val in t_vals:
+                    cx = ws_comp.cell(row=ridx, column=col_idx, value=round(val, 4))
+                    cx.fill = fill_row; cx.border = border; cx.alignment = right_al
+                    col_idx += 1
+
+        wb.save(fname)
+        QtWidgets.QMessageBox.information(self, "Excel", f"Guardado en:\n{fname}")
+
     def _export_pdf(self):
         try:
             from reportlab.lib.pagesizes import A4
@@ -1759,7 +2061,7 @@ class ResultsDialog(QtWidgets.QDialog):
             _fecha_fmt = meta.get("date", "Error en formato de fecha")
         md = [
             ["Fecha (UTC)", _fecha_fmt],
-            ["Modo", "Constraints" if meta.get("mode")=="constraints" else "Tiempo fijo"],
+            ["Modo", "Restricciones" if meta.get("mode")=="constraints" else "Tiempo fijo"],
             ["Tipo de dosis", self.dose_mode_text],
             ["Protocolo de boro", _resolve_boro_protocol_name(meta.get("boro_protocol_name", "Manual"))],
             ["Tiempo", format_value_uncertainty(meta.get("time",0), meta.get("time_err",0), "s")],
@@ -1777,11 +2079,11 @@ class ResultsDialog(QtWidgets.QDialog):
             except Exception:
                 ach_txt = str(ach)
             extra_t = f", t={tval:.3f}s" if isinstance(tval,(int,float)) else ""
-            md.append(["Constraint limitante", f"{org} - {typ} (límite {lim} {_pdf_unit}, logrado {ach_txt} {_pdf_unit}{extra_t})"])
+            md.append(["Restricción limitante", f"{org} - {typ} (límite {lim} {_pdf_unit}, logrado {ach_txt} {_pdf_unit}{extra_t})"])
 
         constraints_used = meta.get("constraints_used") or []
         if meta.get("mode") == "constraints" and constraints_used:
-            md.append(["Cantidad de constraints", str(len(constraints_used))])
+            md.append(["Cantidad de restricciones", str(len(constraints_used))])
         t_meta = Table([["Campo","Valor"]]+md, colWidths=(150, 370))
         t_meta.setStyle(TableStyle([
             ("BACKGROUND",(0,0),(-1,0), colors.HexColor("#f0f0f0")),
@@ -1837,9 +2139,9 @@ class ResultsDialog(QtWidgets.QDialog):
 
         constraints_used = meta.get("constraints_used") or []
         if meta.get("mode") == "constraints" and constraints_used:
-            story.append(Paragraph("Constraints considerados", styles["Heading2"]))
+            story.append(Paragraph("Restricciones consideradas", styles["Heading2"]))
             _cons_unit = dose_axis_unit(self.use_bio, self.is_isoe)
-            data_cons = [["Órgano", "Constraint", f"Límite ({_cons_unit})"]]
+            data_cons = [["Órgano", "Restricción", f"Límite ({_cons_unit})"]]
             for c in constraints_used:
                 org = str(c.get("org", "?"))
                 disp = str(c.get("display") or c.get("metric") or "?")
@@ -1936,14 +2238,14 @@ class ResultsDialog(QtWidgets.QDialog):
 
         # ===== Métricas (tabla) =====
         head = ("Métricas de Dosis Isoefectiva (Photon IsoE): Gy(IsoE)" if getattr(self,"is_isoe",False) else ("Métricas de Dosis Equivalente pesada por RBE: Gy(RBE)" if self.use_bio else "Métricas de Dosis Física: Gy"))
-        data_metrics = [["Órgano","Dmax ± σ","Dmin ± σ","Dmean ± σ","D95 ± σ","D5 ± σ"]]
+        data_metrics = [["Órgano", "Dosis Promedio ± σ", "Dosis Mínima ± σ", "Dosis Máxima ± σ", "D95 ± σ", "D5 ± σ"]]
         for key in sorted(self.dsum.keys()):
             v = self.dsum[key]
             row = [
                 key,
-                f"{v['Dmax']:.2f} ± {v['Sigma_Dmax']:.2f}",
-                f"{v['Dmin']:.2f} ± {v['Sigma_Dmin']:.2f}",
                 f"{v['Dmean']:.2f} ± {v['Sigma_Dmean']:.2f}",
+                f"{v['Dmin']:.2f} ± {v['Sigma_Dmin']:.2f}",
+                f"{v['Dmax']:.2f} ± {v['Sigma_Dmax']:.2f}",
                 f"{v['D95']:.2f} ± {v['Sigma_D95']:.2f}",
                 f"{v['D5']:.2f} ± {v['Sigma_D5']:.2f}",
             ]

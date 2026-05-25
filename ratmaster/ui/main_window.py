@@ -206,7 +206,7 @@ class BNCTMain(QtWidgets.QMainWindow):
         lay_modo = QtWidgets.QVBoxLayout(box_modo)
 
         self.rb_time = QtWidgets.QRadioButton("Tiempo fijo")
-        self.rb_cons = QtWidgets.QRadioButton("Constraints")
+        self.rb_cons = QtWidgets.QRadioButton("Restricciones de dosis")
         self.rb_cons.setChecked(True)
 
         lay_modo.addWidget(self.rb_time)
@@ -329,8 +329,8 @@ class BNCTMain(QtWidgets.QMainWindow):
 
         leftlay.addWidget(self.box_time)
 
-        # CONSTRAINTS
-        self.box_cons = QtWidgets.QGroupBox("Constraints")
+        # RESTRICCIONES DE DOSIS
+        self.box_cons = QtWidgets.QGroupBox("Restricciones de dosis")
         lay_cons = QtWidgets.QVBoxLayout(self.box_cons)
 
         # Tabla interna (se edita en popup)
@@ -343,12 +343,12 @@ class BNCTMain(QtWidgets.QMainWindow):
         rowc = QtWidgets.QHBoxLayout()
         rowc.setContentsMargins(6, 8, 6, 6)
         rowc.setSpacing(10)
-        self.lbl_cons_preset = QtWidgets.QLabel("Constraint: no se seleccionó")
+        self.lbl_cons_preset = QtWidgets.QLabel("Restricción: no se seleccionó")
         self.lbl_cons_preset.setStyleSheet("color:#546E7A; font-size:9pt; padding-top:2px; padding-bottom:2px;")
         self.lbl_cons_preset.setMinimumHeight(24)
         rowc.addWidget(self.lbl_cons_preset, 1)
 
-        self.btn_edit_cons = QtWidgets.QPushButton("Editar constraints…")
+        self.btn_edit_cons = QtWidgets.QPushButton("Editar restricciones…")
         self.btn_edit_cons.setMinimumHeight(28)
         self.btn_edit_cons.clicked.connect(self.open_constraints_dialog)
         rowc.addWidget(self.btn_edit_cons, 0, QtCore.Qt.AlignVCenter)
@@ -604,24 +604,24 @@ QListWidget::indicator:checked {
                 self.constraints_preset_name = dlg.selected_preset_name()
                 if hasattr(self, "lbl_cons_preset"):
                     if self.constraints_preset_name:
-                        self.lbl_cons_preset.setText(f"Constraint: {self.constraints_preset_name}")
+                        self.lbl_cons_preset.setText(f"Restricción: {self.constraints_preset_name}")
                     else:
-                        self.lbl_cons_preset.setText("Constraint: manual")
-                self.status.setText(f"Constraint activo: {self.constraints_preset_name or 'manual'}")
+                        self.lbl_cons_preset.setText("Restricción: manual")
+                self.status.setText(f"Restricción activa: {self.constraints_preset_name or 'manual'}")
                 # Popup de confirmación
                 preset_display = self.constraints_preset_name if self.constraints_preset_name else "manual"
                 QtWidgets.QMessageBox.information(
                     self,
-                    "✔ Constraints activos",
-                    f"Los constraints han sido aplicados correctamente.\n\n"
+                    "✔ Restricciones activas",
+                    f"Las restricciones de dosis han sido aplicadas correctamente.\n\n"
                     f"Preset activo: {preset_display}\n\n"
-                    f"Están listos para ser usados en el próximo cálculo."
+                    f"Están listas para ser usadas en el próximo cálculo."
                 )
             else:
                 self.constraints_preset_name = ""
                 if hasattr(self, "lbl_cons_preset"):
-                    self.lbl_cons_preset.setText("Constraint: no se seleccionó")
-                self.status.setText("Constraint activo: no se seleccionó")
+                    self.lbl_cons_preset.setText("Restricción: no se seleccionó")
+                self.status.setText("Restricción activa: no seleccionada")
 
             self._save_config()
 
@@ -644,7 +644,7 @@ QListWidget::indicator:checked {
 
         self.constraints_preset_name = ""
         if hasattr(self, "lbl_cons_preset"):
-            self.lbl_cons_preset.setText("Constraint: no se seleccionó")
+            self.lbl_cons_preset.setText("Restricción: no se seleccionó")
         self._update_active_protocol_label()
         self.read_ui_into_state()
 
@@ -825,7 +825,7 @@ QListWidget::indicator:checked {
                 dosevx = cons[4, j]
 
                 if min(dmax, dmean, dmin, vx, dosevx) < 0:
-                    return False, f"No se permiten constraints negativos ({ORG_ORDER[j]})."
+                    return False, f"No se permiten restricciones negativas ({ORG_ORDER[j]})."
                 if vx > 100:
                     return False, f"El porcentaje (%) no puede ser mayor que 100 ({ORG_ORDER[j]})."
                 if (vx > 0 and dosevx <= 0) or (dosevx > 0 and vx <= 0):
@@ -833,7 +833,7 @@ QListWidget::indicator:checked {
                 if dmax > 0 or dmean > 0 or dmin > 0 or (vx > 0 and dosevx > 0):
                     has_any = True
             if not has_any:
-                return False, "En modo constraints tenés que definir al menos un constraint válido."
+                return False, "En modo restricciones tenés que definir al menos una restricción válida."
 
             # Verificar que al menos un constraint definido corresponde a un órgano
             # efectivamente cargado en los vectores actuales.
@@ -887,7 +887,7 @@ QListWidget::indicator:checked {
     def _mark_constraints_manual(self, item=None):
         self.constraints_preset_name = ""
         if hasattr(self, "lbl_cons_preset"):
-            self.lbl_cons_preset.setText("Constraint: manual")
+            self.lbl_cons_preset.setText("Restricción: manual")
 
 
     def _refresh_proto_combo(self, selected_name=None):
@@ -1466,11 +1466,11 @@ QListWidget::indicator:checked {
                 t_sigma = float(report.get("meta", {}).get("time_err", 0.0))
 
                 msg = QtWidgets.QMessageBox(self)
-                msg.setWindowTitle("Tiempo óptimo (Constraints)")
+                msg.setWindowTitle("Tiempo óptimo (Restricciones de dosis)")
                 msg.setIcon(QtWidgets.QMessageBox.Information)
                 msg.setText(
                     f"<h1>Tiempo usado para el cálculo: {format_value_uncertainty(t, t_sigma, 's')}</h1>"
-                    f"<p><b>Órgano / constraint limitante:</b> {org}</p>"
+                    f"<p><b>Órgano / restricción limitante:</b> {org}</p>"
                     f"<p><b>Tipo:</b> {typ} &nbsp;&nbsp; <b>Límite:</b> {lim} {dose_axis_unit(self.use_bio_mode, self.use_isoe_mode)}</p>"
                     f"<p><b>Valor logrado:</b> {ach:.3f} {dose_axis_unit(self.use_bio_mode, self.use_isoe_mode)}</p>"
                 )

@@ -61,7 +61,7 @@ class ConstraintsDialog(QtWidgets.QDialog):
     """
     def __init__(self, parent, tbl_cons: QtWidgets.QTableWidget, preset_name: str = ""):
         super().__init__(parent)
-        self.setWindowTitle("Constraints (editar)")
+        self.setWindowTitle("Restriciones de Dosis (editar)")
         self.resize(980, 420)
         self._norg = len(ORG_ORDER)
         self._selected_name = preset_name.strip() if preset_name else ""
@@ -114,7 +114,7 @@ class ConstraintsDialog(QtWidgets.QDialog):
             del blocker
             self._copy_from(tbl_cons)
             self._selected_name = ""
-            self.lbl_info.setText("Constraint manual.")
+            self.lbl_info.setText("Restricciones de Dosis manuales.")
 
     def _reload_combo(self):
         self.cmb_preset.clear()
@@ -147,7 +147,7 @@ class ConstraintsDialog(QtWidgets.QDialog):
         if text == "Elegir manualmente":
             self._selected_name = ""
             self._set_matrix(_make_constraints_matrix(0.0))
-            self.lbl_info.setText("Constraint manual.")
+            self.lbl_info.setText("Restricción de Dosis manuales.")
             return
         mat = CONSTRAINT_PRESETS.get(text)
         if mat is None:
@@ -163,7 +163,7 @@ class ConstraintsDialog(QtWidgets.QDialog):
         self.cmb_preset.setCurrentText("Elegir manualmente")
         del blocker
         self._selected_name = ""
-        self.lbl_info.setText("Constraint manual.")
+        self.lbl_info.setText("Restricciones de Dosis manuales.")
 
     def _read_matrix(self):
         cons = np.zeros((5, self._norg), dtype=float)
@@ -183,7 +183,7 @@ class ConstraintsDialog(QtWidgets.QDialog):
         try:
             mat = self._read_matrix()
         except Exception as e:
-            QtWidgets.QMessageBox.warning(self, "Constraints", str(e))
+            QtWidgets.QMessageBox.warning(self, "Restriciones de Dosis", str(e))
             return
         name, ok = QtWidgets.QInputDialog.getText(self, "Guardar preset", "Nombre del nuevo preset:")
         name = (name or "").strip()
@@ -201,10 +201,10 @@ class ConstraintsDialog(QtWidgets.QDialog):
     def _delete_current_preset(self):
         name = self.cmb_preset.currentText().strip()
         if name == "Elegir manualmente":
-            QtWidgets.QMessageBox.information(self, "Constraints", "No hay un preset seleccionado para borrar.")
+            QtWidgets.QMessageBox.information(self, "Restriciones de Dosis", "No hay un preset seleccionado para borrar.")
             return
         if _is_builtin_constraint_preset(name):
-            QtWidgets.QMessageBox.warning(self, "Constraints", "No se puede borrar un preset incorporado.")
+            QtWidgets.QMessageBox.warning(self, "Restriciones de Dosis", "No se puede borrar un preset incorporado.")
             return
         if QtWidgets.QMessageBox.question(self, "Borrar preset", f"¿Borrar el preset '{name}'?") != QtWidgets.QMessageBox.Yes:
             return
@@ -218,7 +218,7 @@ class ConstraintsDialog(QtWidgets.QDialog):
         try:
             self._read_matrix()
         except Exception as e:
-            QtWidgets.QMessageBox.warning(self, "Constraints", str(e))
+            QtWidgets.QMessageBox.warning(self, "Restriciones de Dosis", str(e))
             return
         self.accept()
 
