@@ -93,13 +93,66 @@ TISSUE_CATEGORIES: dict[str, dict] = {
         "label":       "Piel",
         "description": "Tejido cutáneo superficial.",
         "organ_hints": ["skin", "piel", "dermis", "cutaneo"],
-        "color":       "#2E7D32",
+        "color":       "#D38D00",
     },
     "mucosa": {
         "label":       "Mucosa",
         "description": "Mucosa oral, nasal o de vías aéreas.",
         "organ_hints": ["mucosa", "mucous", "oralmucosa", "mucosaoral"],
         "color":       "#2E7D32",
+    },
+    "normal_lung": {
+        "label":       "Pulmón normal",
+        "description": "Parénquima pulmonar, pulmón total, pulmón ipsi/contralateral.",
+        "organ_hints": [
+            "pulmon", "lung", "pulmontotal", "pulmonizq", "pulmonder",
+            "pulmonipsi", "pulmoncontra", "normalpulmon", "normallung",
+        ],
+        "color":       "#00838F",
+    },
+    "liver": {
+        "label":       "Hígado",
+        "description": "Parénquima hepático.",
+        "organ_hints": [
+            "higado", "liver", "hepatico", "hepatic",
+        ],
+        "color":       "#558B2F",
+    },
+    "kidney": {
+        "label":       "Riñón",
+        "description": "Riñones (ipsi y contralateral).",
+        "organ_hints": [
+            "rinon", "kidney", "renal", "rinones",
+            "kidneyipsi", "kidneycontra",
+        ],
+        "color":       "#6D4C41",
+    },
+    "salivary_gland": {
+        "label":       "Glándulas salivales",
+        "description": "Parótidas, submandibulares, sublinguales.",
+        "organ_hints": [
+            "parotida", "parotid", "submandibular", "sublingual",
+            "salivary", "glandulasal", "glandulasalivary",
+        ],
+        "color":       "#F52217",
+    },
+    "bone_marrow": {
+        "label":       "Médula ósea",
+        "description": "Médula ósea activa (roja).",
+        "organ_hints": [
+            "bonemarrow", "medulaosea", "marrow", "redmarrow",
+            "medulaactiva", "activemarrow",
+        ],
+        "color":       "#4527A0",
+    },
+    "eye": {
+        "label":       "Ojo / cristalino",
+        "description": "Globo ocular y cristalino.",
+        "organ_hints": [
+            "eye", "lens", "cristalino", "ojoder", "ojoizq",
+            "globoocular", "eyeright", "eyeleft",
+        ],
+        "color":       "#0277BD",
     },
     "unknown": {
         "label":       "Sin clasificar",

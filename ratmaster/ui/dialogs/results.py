@@ -1226,7 +1226,7 @@ class CalculationParamsDialog(QtWidgets.QDialog):
         # ════════════════════════════════════════════════════════════════
         constraints_used = meta.get("constraints_used") or []
         if meta.get("mode") == "constraints" and constraints_used:
-            _, gl3 = _group(f"Constraints activas — unidad: {unit}")
+            _, gl3 = _group(f"Restricciones activas — unidad: {unit}")
             hdrs3 = ["Órgano", "Tipo", f"Límite ({unit})"]
             rows3 = []
             for c in constraints_used:

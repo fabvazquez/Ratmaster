@@ -484,6 +484,15 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
         self._tbl_t0.itemChanged.connect(self._on_edited)
         for ed in self._biexp_edits.values():
             ed.textChanged.connect(self._on_edited)
+        # Nuevos campos de metadata
+        self._edit_tissue.textChanged.connect(self._on_edited)
+        self._edit_model_system.textChanged.connect(self._on_edited)
+        self._edit_endpoint.textChanged.connect(self._on_edited)
+        self._edit_boron_compound.textChanged.connect(self._on_edited)
+        self._edit_approx_notes.textChanged.connect(self._on_edited)
+        self._cmb_tissue_type.currentIndexChanged.connect(
+            lambda _: self._update_tissue_warn()
+        )
         self._btn_save.clicked.connect(self._save)
         self._btn_delete.clicked.connect(self._delete)
 
@@ -514,23 +523,72 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
     def _build_meta_group(self) -> QtWidgets.QGroupBox:
         grp = QtWidgets.QGroupBox("Información de validación del preset")
         form = QtWidgets.QFormLayout(grp)
-        form.setSpacing(4)
-        self._lbl_tissue    = _lbl("", "#455A64", wrap=True)
-        self._lbl_tt        = _lbl("", "#455A64")
-        self._lbl_model     = _lbl("", "#455A64", wrap=True)
-        self._lbl_endpoint  = _lbl("", "#455A64", wrap=True)
-        self._lbl_compound  = _lbl("", "#455A64")
-        self._lbl_approx_lv = _lbl("", "#455A64")
-        self._lbl_approx    = _lbl("", "#455A64", italic=True, wrap=True)
-        self._lbl_comments  = _lbl("", "#455A64", italic=True, wrap=True)
-        form.addRow("Tejido:", self._lbl_tissue)
-        form.addRow("Categoría:", self._lbl_tt)
-        form.addRow("Sistema modelo:", self._lbl_model)
-        form.addRow("Endpoint:", self._lbl_endpoint)
-        form.addRow("Compuesto B:", self._lbl_compound)
-        form.addRow("Nivel aprox.:", self._lbl_approx_lv)
-        form.addRow("Aproximaciones:", self._lbl_approx)
-        form.addRow("Comentarios:", self._lbl_comments)
+        form.setSpacing(6)
+
+        form.addRow(_lbl(
+            "Completá estos campos al crear un preset nuevo — se guardan junto con los parámetros.",
+            "#1565C0", italic=True, wrap=True,
+        ))
+
+        self._edit_tissue = QtWidgets.QLineEdit()
+        self._edit_tissue.setPlaceholderText("ej: Pulmón normal (rata), Tumor gliosarcoma (9L)…")
+        self._edit_tissue.setToolTip("Descripción libre del tejido al que aplican los parámetros.")
+        form.addRow("Tejido:", self._edit_tissue)
+
+        self._cmb_tissue_type = QtWidgets.QComboBox()
+        for tt, info in TISSUE_CATEGORIES.items():
+            self._cmb_tissue_type.addItem(info["label"], tt)
+        self._cmb_tissue_type.setToolTip(
+            "Categoría de tejido. Determina con qué órganos es compatible el preset."
+        )
+        form.addRow("Categoría:", self._cmb_tissue_type)
+
+        self._edit_model_system = QtWidgets.QLineEdit()
+        self._edit_model_system.setPlaceholderText(
+            "ej: Rata Wistar, pulmón in vivo, irradiación con fotones de Co-60…"
+        )
+        self._edit_model_system.setToolTip(
+            "Sistema experimental o clínico del que se extrajeron los parámetros."
+        )
+        form.addRow("Sistema modelo:", self._edit_model_system)
+
+        self._edit_endpoint = QtWidgets.QLineEdit()
+        self._edit_endpoint.setPlaceholderText(
+            "ej: Supervivencia clonogénica S=0.01 · Fibrosis pulmonar LD₅₀ · Parálisis ED₅₀…"
+        )
+        self._edit_endpoint.setToolTip(
+            "Endpoint radiobiológico medido en el que se basan los parámetros."
+        )
+        form.addRow("Endpoint:", self._edit_endpoint)
+
+        self._edit_boron_compound = QtWidgets.QLineEdit()
+        self._edit_boron_compound.setPlaceholderText("ej: BPA i.v. 250 mg/kg · BSH · —")
+        self._edit_boron_compound.setToolTip(
+            "Compuesto de boro y dosis usada en el experimento de derivación de parámetros."
+        )
+        form.addRow("Compuesto B:", self._edit_boron_compound)
+
+        self._cmb_approx_level = QtWidgets.QComboBox()
+        self._cmb_approx_level.addItem("Completo (sin aprox.)",              "full")
+        self._cmb_approx_level.addItem("Estándar (aprox. justificadas)",     "standard")
+        self._cmb_approx_level.addItem("Manual / usuario",                   "manual")
+        self._cmb_approx_level.setToolTip(
+            "full: todos los parámetros ajustados independientemente.\n"
+            "standard: algunas aprox. documentadas (aTh=aFn, aG=aR, etc.).\n"
+            "manual: preset ingresado por el usuario sin validación bibliográfica."
+        )
+        form.addRow("Nivel de aprox.:", self._cmb_approx_level)
+
+        self._edit_approx_notes = QtWidgets.QPlainTextEdit()
+        self._edit_approx_notes.setMaximumHeight(80)
+        self._edit_approx_notes.setPlaceholderText(
+            "Describí qué se aproximó y por qué (ej: aTh = aFn por LET similar; GR = 1 ref. aguda)…"
+        )
+        self._edit_approx_notes.setToolTip(
+            "Justificación de las aproximaciones usadas. Aparece en el panel de info del preset."
+        )
+        form.addRow("Aproximaciones:", self._edit_approx_notes)
+
         return grp
 
     def _build_params_group(self) -> QtWidgets.QGroupBox:
@@ -723,34 +781,20 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
             params  = p.get("params") or {}
             t0_map  = p.get("t0_map") or {}
             tt      = p.get("tissue_type", "unknown")
-            tt_info = TISSUE_CATEGORIES.get(tt, {})
 
-            self._lbl_tissue.setText(p.get("tissue", "Sin especificar"))
-            self._lbl_tt.setText(tt_info.get("label", tt))
-            self._lbl_model.setText(p.get("model_system", "—"))
-            self._lbl_endpoint.setText(p.get("endpoint", "—"))
-            self._lbl_compound.setText(p.get("boron_compound", "—"))
-            alv = p.get("approximation_level", "")
-            alv_lbl = {"full": "Completo (sin aprox.)",
-                       "standard": "Estándar (aprox. justificadas)",
-                       "manual": "Manual / usuario"}.get(alv, alv)
-            self._lbl_approx_lv.setText(alv_lbl)
-            self._lbl_approx.setText(p.get("approx_notes", "—"))
-            self._lbl_comments.setText(p.get("comments", ""))
+            self._edit_tissue.setText(p.get("tissue", ""))
+            idx_tt = self._cmb_tissue_type.findData(tt)
+            self._cmb_tissue_type.setCurrentIndex(max(idx_tt, 0))
+            self._edit_model_system.setText(p.get("model_system", ""))
+            self._edit_endpoint.setText(p.get("endpoint", ""))
+            self._edit_boron_compound.setText(p.get("boron_compound", ""))
+            alv = p.get("approximation_level", "manual")
+            idx_alv = self._cmb_approx_level.findData(alv)
+            self._cmb_approx_level.setCurrentIndex(max(idx_alv, 0))
+            self._edit_approx_notes.setPlainText(p.get("approx_notes", ""))
 
             # Advertencia por tipo de tejido
-            if tt == "tumor":
-                self._lbl_warn.setText(
-                    "⚠ PARÁMETROS TUMORALES — No aplicar a órganos de tejido sano."
-                )
-                self._lbl_warn.setVisible(True)
-            elif tt in ("normal_brain", "spinal_cord", "skin", "mucosa"):
-                self._lbl_warn.setText(
-                    "⚠ PARÁMETROS DE TEJIDO SANO — No aplicar a volúmenes tumorales."
-                )
-                self._lbl_warn.setVisible(True)
-            else:
-                self._lbl_warn.setVisible(False)
+            self._update_tissue_warn(tt)
 
             # Parámetros numéricos
             for i, key in enumerate(self.PARAM_KEYS):
@@ -794,6 +838,23 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
             if name != "Manual" else
             "Modo manual — editá los parámetros directamente."
         )
+
+    def _update_tissue_warn(self, tt: str | None = None):
+        """Actualiza el banner de advertencia según el tissue_type seleccionado."""
+        if tt is None:
+            tt = self._cmb_tissue_type.currentData() or "unknown"
+        if tt == "tumor":
+            self._lbl_warn.setText(
+                "⚠ PARÁMETROS TUMORALES — No aplicar a órganos de tejido sano."
+            )
+            self._lbl_warn.setVisible(True)
+        elif tt in ("normal_brain", "spinal_cord", "skin", "mucosa"):
+            self._lbl_warn.setText(
+                "⚠ PARÁMETROS DE TEJIDO SANO — No aplicar a volúmenes tumorales."
+            )
+            self._lbl_warn.setVisible(True)
+        else:
+            self._lbl_warn.setVisible(False)
 
     def _switch_repair(self, rm_key: str):
         if rm_key == "biexp":
@@ -896,16 +957,27 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
                 except ValueError as e:
                     raise ValueError(f"t0[{key}]: {e}")
 
-        ref      = self._edit_ref.text().strip()
-        organs   = [x.strip() for x in self._edit_organs.text().split(",") if x.strip()]
-        comments = self._edit_comments.toPlainText().strip()
-        return params, t0_map, ref, rm, organs, comments
+        ref           = self._edit_ref.text().strip()
+        organs        = [x.strip() for x in self._edit_organs.text().split(",") if x.strip()]
+        comments      = self._edit_comments.toPlainText().strip()
+        tissue        = self._edit_tissue.text().strip()
+        tissue_type   = self._cmb_tissue_type.currentData() or "unknown"
+        model_system  = self._edit_model_system.text().strip()
+        endpoint      = self._edit_endpoint.text().strip()
+        boron_compound = self._edit_boron_compound.text().strip()
+        approx_level  = self._cmb_approx_level.currentData() or "manual"
+        approx_notes  = self._edit_approx_notes.toPlainText().strip()
+        return (params, t0_map, ref, rm, organs, comments,
+                tissue, tissue_type, model_system, endpoint,
+                boron_compound, approx_level, approx_notes)
 
     # ── Guardar / borrar ───────────────────────────────────────────────────────
 
     def _save(self):
         try:
-            params, t0_map, ref, rm, organs, comments = self._read_form()
+            (params, t0_map, ref, rm, organs, comments,
+             tissue, tissue_type, model_system, endpoint,
+             boron_compound, approx_level, approx_notes) = self._read_form()
             IsoEParams(**{k: v for k, v in params.items()
                           if k in IsoEParams.NUMERIC_KEYS + IsoEParams.BIEXP_KEYS + ["repair_model"]})
         except Exception as e:
@@ -931,14 +1003,14 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
 
         new_preset = {
             "ref":                 ref or "Usuario",
-            "tissue":              "Sin especificar (usuario)",
-            "tissue_type":         "unknown",
+            "tissue":              tissue or "Sin especificar (usuario)",
+            "tissue_type":         tissue_type,
             "valid_organs":        organs,
-            "model_system":        "Ingresado por el usuario",
-            "endpoint":            "—",
-            "boron_compound":      "—",
-            "approximation_level": "manual",
-            "approx_notes":        "Preset ingresado manualmente.",
+            "model_system":        model_system or "Ingresado por el usuario",
+            "endpoint":            endpoint or "—",
+            "boron_compound":      boron_compound or "—",
+            "approximation_level": approx_level,
+            "approx_notes":        approx_notes or "Preset ingresado manualmente.",
             "comments":            comments,
             "params":              params,
             "t0_map":              t0_map if rm == "monoexp" else None,
