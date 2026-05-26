@@ -854,6 +854,20 @@ class DoseViewerDialog(QtWidgets.QDialog):
         self.spin_vmin.valueChanged.connect(self._on_clim_changed)
         self.spin_vmax.valueChanged.connect(self._on_clim_changed)
         self.btn_auto.clicked.connect(self._autoscale)
+        # ── Render inicial ────────────────────────────────────────────────
+        if self.organ_combo.count() > 0:
+            self.current_organ = self.organ_combo.itemText(0)
+        # Inicializar el slider de cortes con la orientación por defecto
+        n = max(self._slice_count(0), 1)
+        mid = n // 2
+        self.slice_slider.blockSignals(True)
+        self.slice_slider.setMaximum(n - 1)
+        self.slice_slider.setValue(mid)
+        self.slice_slider.blockSignals(False)
+        self.current_slice = mid
+        self.slice_label.setText(f"{mid} / {n - 1}")
+        # Autoscale ajusta vmin/vmax y llama a _render_and_display()
+        self._autoscale()
 
     # ── Lógica de datos ──────────────────────────────────────────────────
 
