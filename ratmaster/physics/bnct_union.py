@@ -85,6 +85,107 @@ def load_seg_with_lut(seg_path: str, pixel_size_mm=(1.0, 1.0, 1.0)) -> dict:
     }
 
 
+def load_tif_with_lut(tif_path: str,
+                      material_names: list[str] | None = None,
+                      pixel_size_mm: tuple = (1.0, 1.0, 1.0)) -> dict:
+    """
+    Carga un TIFF de segmentación (uint8, 3D) y construye la misma
+    estructura que load_seg_with_lut.
+
+    El TIFF no tiene metadatos de materiales, así que los nombres se
+    proveen externamente o se generan automáticamente.
+
+    Args:
+        tif_path:        path al archivo .tif / .tiff
+        material_names:  lista [fondo, mat1, mat2, ...] en el mismo orden
+                         que load_seg_with_lut. Si es None se usan nombres
+                         genéricos "Org0", "Org1", etc.
+                         Tip: pasá seg_result["MaterialNames"] si ya tenés
+                         el .seg de referencia.
+        pixel_size_mm:   (sx, sy, sz) tamaño de vóxel en mm.
+
+    Retorna el mismo dict que load_seg_with_lut:
+        {MaterialNames, Matrix (X,Y,Z) int32, LUT, VoxelSize_mm, Extent_mm}
+    """
+    try:
+        import tifffile
+    except ImportError as exc:
+        raise ImportError(
+            "tifffile no está instalado. Instalalo con:  pip install tifffile"
+        ) from exc
+
+    with tifffile.TiffFile(tif_path) as tif:
+        data = tif.asarray()
+
+    if data.ndim != 3:
+        raise ValueError(
+            f"Se esperaba un array 3D (Z, Y, X) o (X, Y, Z), "
+            f"se obtuvo shape={data.shape}. "
+            f"Si es una carpeta de slices 2D, pasalos como lista."
+        )
+
+    # tifffile devuelve (Z, Y, X) en la mayoría de los exportadores —
+    # transponemos a (X, Y, Z) para coincidir con el formato .seg.
+    # Si el shape es cuadrado (256,256,256) no importa, pero lo dejamos
+    # explícito para casos no-cúbicos.
+    #
+    # pixel_size_mm=(sx, sy, sz) sigue la misma convención que en el resto
+    # del pipeline y en la UI: sx es el tamaño del vóxel en el eje X de la
+    # mesh (eje 0 del matrix resultante), sy en Y (eje 1) y sz en Z (eje 2).
+    # La transpose(2,1,0) reordena los datos del TIFF pero NO altera qué
+    # tamaño físico le corresponde a cada eje lógico del matrix: eso lo
+    # determina el usuario al ingresar los valores en la UI, y se aplican
+    # las correcciones geométricas (swap/flip/rot90) a continuación mediante
+    # apply_seg_transforms_with_voxelsize, igual que para archivos .seg.
+    sx_mat, sy_mat, sz_mat = pixel_size_mm
+    matrix = data.transpose(2, 1, 0).astype(np.int32, copy=False)
+    X, Y, Z = matrix.shape
+
+    unique_labels = sorted(np.unique(matrix))
+    labels_no_zero = [lab for lab in unique_labels if lab != 0]
+
+    # Construir la lista de nombres: el índice 0 es siempre el fondo
+    if material_names is None:
+        n_total = 1 + len(labels_no_zero)
+        material_names = [f"Org{i}" for i in range(n_total)]
+
+    lut: dict[int, str] = {0: material_names[0] if material_names else "Fondo"}
+    for i, lab in enumerate(labels_no_zero, start=1):
+        if i < len(material_names):
+            lut[int(lab)] = material_names[i]
+        else:
+            lut[int(lab)] = f"Org{int(lab)}"
+
+    extent = (X * sx_mat, Y * sy_mat, Z * sz_mat)
+
+    return {
+        "MaterialNames": list(material_names),
+        "Matrix":        matrix,
+        "LUT":           lut,
+        "VoxelSize_mm":  (sx_mat, sy_mat, sz_mat),
+        "Extent_mm":     extent,
+    }
+
+
+def load_seg_auto(path: str,
+                  pixel_size_mm: tuple = (1.0, 1.0, 1.0),
+                  material_names: list[str] | None = None) -> dict:
+    """
+    Wrapper que elige automáticamente load_seg_with_lut o load_tif_with_lut
+    según la extensión del archivo.
+
+    Para .tif/.tiff podés pasar material_names si los tenés; si no, se
+    generan nombres genéricos.
+    """
+    ext = Path(path).suffix.lower()
+    if ext in (".tif", ".tiff"):
+        return load_tif_with_lut(path, material_names=material_names,
+                                 pixel_size_mm=pixel_size_mm)
+    else:
+        # .seg y cualquier otro formato binario propio
+        return load_seg_with_lut(path, pixel_size_mm=pixel_size_mm)
+
+
 # ===========================
 # SEG: correcciones geométricas
 # ===========================
@@ -93,8 +194,120 @@ def swap_YZ(segM: np.ndarray) -> np.ndarray:
     return np.swapaxes(segM, 1, 2)
 
 def rotate_segmentation(segM: np.ndarray) -> np.ndarray:
-    """Ejemplo: flip X y flip Z. Ajustar según convención real."""
+    """Corrección por defecto (compatibilidad): flip X y flip Z."""
     return np.flip(np.flip(segM, axis=0), axis=2)
+
+# Mapa de nombres de eje a índice
+_AXIS_INDEX = {"X": 0, "Y": 1, "Z": 2}
+
+# Mapa de nombres de swap a pares de ejes
+_SWAP_AXES = {
+    "swap_XY": (0, 1),
+    "swap_XZ": (0, 2),
+    "swap_YZ": (1, 2),
+}
+
+def apply_seg_transforms(segM: np.ndarray,
+                          transforms: list[dict]) -> tuple[np.ndarray, tuple]:
+    """
+    Aplica una secuencia arbitraria de transformaciones geométricas a la
+    segmentación y calcula el nuevo voxel_size_mm resultante.
+
+    Cada transformación es un dict con la clave "op":
+        {"op": "flip_X"}              → np.flip(segM, axis=0)
+        {"op": "flip_Y"}              → np.flip(segM, axis=1)
+        {"op": "flip_Z"}              → np.flip(segM, axis=2)
+        {"op": "swap_XY"}             → np.swapaxes(segM, 0, 1)
+        {"op": "swap_XZ"}             → np.swapaxes(segM, 0, 2)
+        {"op": "swap_YZ"}             → np.swapaxes(segM, 1, 2)
+        {"op": "rot90_XY", "k": 1}    → np.rot90(segM, k=k, axes=(0,1))
+        {"op": "rot90_XZ", "k": 1}    → np.rot90(segM, k=k, axes=(0,2))
+        {"op": "rot90_YZ", "k": 1}    → np.rot90(segM, k=k, axes=(1,2))
+
+    Retorna:
+        (segM_transformed, voxel_size_mm_new)
+        voxel_size_mm_new refleja swaps de ejes; las demás ops no cambian el tamaño.
+
+    Nota: voxel_size_mm_new es solo informativo para el swap; rot90 en planos
+    con voxels isótropos es transparente; en anisótropos debe verificarse
+    manualmente que el resultado físico sea correcto.
+    """
+    # Mantenemos un arreglo de los tamaños de voxel para trackear swaps
+    # (no se pasa voxel_size_mm aquí porque la función es solo de array;
+    # el diálogo se encarga de actualizar Seg["VoxelSize_mm"] por separado)
+    result = segM.copy() if not segM.flags["C_CONTIGUOUS"] else segM
+
+    for t in transforms:
+        op = t.get("op", "")
+        if op == "flip_X":
+            result = np.flip(result, axis=0)
+        elif op == "flip_Y":
+            result = np.flip(result, axis=1)
+        elif op == "flip_Z":
+            result = np.flip(result, axis=2)
+        elif op in _SWAP_AXES:
+            a0, a1 = _SWAP_AXES[op]
+            result = np.swapaxes(result, a0, a1)
+        elif op in ("rot90_XY", "rot90_XZ", "rot90_YZ"):
+            plane = op.split("_")[1]   # "XY", "XZ" o "YZ"
+            ax0 = _AXIS_INDEX[plane[0]]
+            ax1 = _AXIS_INDEX[plane[1]]
+            k = int(t.get("k", 1))
+            result = np.rot90(result, k=k, axes=(ax0, ax1))
+        else:
+            raise ValueError(f"Transformación desconocida: '{op}'")
+
+    # Calcular voxel_size_mm_new a partir de los swaps (los flips no la cambian)
+    # Devolvemos None para que el caller la compute si necesita; es responsabilidad
+    # del diálogo actualizar Seg["VoxelSize_mm"] según los swaps que aplicó.
+    return result
+
+
+def apply_seg_transforms_with_voxelsize(segM: np.ndarray,
+                                         voxel_size_mm: tuple,
+                                         transforms: list[dict]) -> tuple[np.ndarray, tuple]:
+    """
+    Igual que apply_seg_transforms pero también propaga voxel_size_mm
+    a través de los swaps de eje.
+
+    Retorna (segM_transformed, voxel_size_mm_new).
+    """
+    vs = list(voxel_size_mm)   # [sx, sy, sz]
+    result = segM
+
+    for t in transforms:
+        op = t.get("op", "")
+        if op == "flip_X":
+            result = np.flip(result, axis=0)
+        elif op == "flip_Y":
+            result = np.flip(result, axis=1)
+        elif op == "flip_Z":
+            result = np.flip(result, axis=2)
+        elif op in _SWAP_AXES:
+            a0, a1 = _SWAP_AXES[op]
+            result = np.swapaxes(result, a0, a1)
+            vs[a0], vs[a1] = vs[a1], vs[a0]   # propagar swap al voxel size
+        elif op in ("rot90_XY", "rot90_XZ", "rot90_YZ"):
+            plane = op.split("_")[1]
+            ax0 = _AXIS_INDEX[plane[0]]
+            ax1 = _AXIS_INDEX[plane[1]]
+            k = int(t.get("k", 1))
+            result = np.rot90(result, k=k, axes=(ax0, ax1))
+            # rot90 en k impar intercambia las dims de los dos ejes del plano
+            if k % 2 == 1:
+                vs[ax0], vs[ax1] = vs[ax1], vs[ax0]
+        else:
+            raise ValueError(f"Transformación desconocida: '{op}'")
+
+    return result, tuple(vs)
+
+
+# Preset por defecto (compatibilidad con el comportamiento anterior)
+DEFAULT_TRANSFORMS = [
+    {"op": "swap_YZ"},
+    {"op": "flip_X"},
+    {"op": "flip_Z"},
+]
 
 
 # ===========================

@@ -13,7 +13,9 @@ Permite:
 import subprocess
 import unicodedata
 import re
+import json
 import numpy as np
+from datetime import datetime
 from pathlib import Path
 from PySide6 import QtCore, QtWidgets, QtGui
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -23,6 +25,122 @@ from ratmaster.app_paths import app_install_dir, user_app_dir
 
 
 from ratmaster.data.vector_loader import _safe_set_name
+
+
+class TiffLabelDialog(QtWidgets.QDialog):
+    """
+    Diálogo para asignar nombres anatómicos a las etiquetas detectadas en un TIFF.
+
+    Muestra una tabla editable con dos columnas:
+      - Valor (etiqueta numérica, solo lectura)
+      - Nombre (editable: nombre anatómico o genérico)
+
+    El usuario puede escribir el nombre de cada órgano/material. Si deja el
+    campo vacío se usa el nombre genérico 'OrgN' (donde N es el valor de la etiqueta).
+
+    Uso:
+        dlg = TiffLabelDialog(parent, unique_labels=[0, 17, 33, 50, ...])
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            material_names = dlg.get_material_names()
+            # Retorna lista [nombre_label_0, nombre_label_1, ...] en el orden
+            # esperado por load_tif_with_lut / load_seg_with_lut.
+    """
+
+    # Mapa de valores típicos de BNCT → nombre anatómico sugerido
+    _KNOWN_LABELS: dict[int, str] = {
+        0:   "Aire",
+        17:  "Carne",
+        33:  "Hueso",
+        50:  "Médula",
+        67:  "Corazón",
+        83:  "Pulmón izquierdo",
+        100: "Pulmón derecho",
+        117: "Cerebro",
+        200: "Piel",
+    }
+
+    def __init__(self, parent, unique_labels: list[int]):
+        super().__init__(parent)
+        self.setWindowTitle("Asignar nombres anatómicos a las etiquetas TIFF")
+        self.resize(480, 400)
+        self._labels = sorted(unique_labels)  # incluye 0 (fondo)
+
+        lay = QtWidgets.QVBoxLayout(self)
+
+        info = QtWidgets.QLabel(
+            "El archivo TIFF no contiene nombres de materiales.\n"
+            "Asigná un nombre anatómico a cada etiqueta detectada.\n"
+            "Si dejás el campo vacío se usará el nombre genérico (OrgN)."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #444; padding-bottom: 6px;")
+        lay.addWidget(info)
+
+        self._table = QtWidgets.QTableWidget(len(self._labels), 2, self)
+        self._table.setHorizontalHeaderLabels(["Valor de etiqueta", "Nombre anatómico"])
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+
+        for row, label in enumerate(self._labels):
+            # Columna 0: valor de etiqueta (solo lectura)
+            item_val = QtWidgets.QTableWidgetItem(str(label))
+            item_val.setFlags(item_val.flags() & ~QtCore.Qt.ItemIsEditable)
+            item_val.setBackground(QtGui.QColor("#f0f0f0"))
+            self._table.setItem(row, 0, item_val)
+
+            # Columna 1: nombre editable, pre-rellenado si es conocido
+            suggested = self._KNOWN_LABELS.get(label, "")
+            item_name = QtWidgets.QTableWidgetItem(suggested)
+            self._table.setItem(row, 1, item_name)
+
+        lay.addWidget(self._table)
+
+        # Botones de acción rápida
+        quick_row = QtWidgets.QHBoxLayout()
+        btn_clear = QtWidgets.QPushButton("Limpiar nombres")
+        btn_clear.setToolTip("Borra todos los nombres (se usarán genéricos OrgN)")
+        btn_clear.clicked.connect(self._clear_names)
+        btn_generic = QtWidgets.QPushButton("Usar genéricos")
+        btn_generic.setToolTip("Rellena con OrgN para cada etiqueta N")
+        btn_generic.clicked.connect(self._fill_generic)
+        quick_row.addWidget(btn_clear)
+        quick_row.addWidget(btn_generic)
+        quick_row.addStretch(1)
+        lay.addLayout(quick_row)
+
+        # Botones OK / Cancelar
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def _clear_names(self):
+        for row in range(self._table.rowCount()):
+            self._table.item(row, 1).setText("")
+
+    def _fill_generic(self):
+        for row, label in enumerate(self._labels):
+            generic = "Fondo" if label == 0 else f"Org{label}"
+            self._table.item(row, 1).setText(generic)
+
+    def get_material_names(self) -> list[str]:
+        """
+        Retorna la lista de nombres en el orden [fondo, mat1, mat2, ...],
+        compatible con el argumento material_names de load_tif_with_lut.
+        Para etiquetas sin nombre asignado se usa el genérico OrgN.
+        """
+        names = []
+        for row, label in enumerate(self._labels):
+            text = (self._table.item(row, 1).text() or "").strip()
+            if not text:
+                text = "Fondo" if label == 0 else f"Org{label}"
+            names.append(text)
+        return names
+
+
 class VectorGenDialog(QtWidgets.QDialog):
     """
     Dialogo para:
@@ -65,7 +183,7 @@ class VectorGenDialog(QtWidgets.QDialog):
         row_mesh.addWidget(btn_mesh)
         w_mesh = QtWidgets.QWidget()
         w_mesh.setLayout(row_mesh)
-        form.addRow("Meshtal MCNP (.msh/.meshtal):", w_mesh)
+        form.addRow("Meshtal MCNP (.msh/.msht/.meshtal):", w_mesh)
 
         # --- voxel size ---
         vs = self.defaults.get("voxel_size_mm", (0.78125, 0.3325, 0.3325))
@@ -113,13 +231,102 @@ class VectorGenDialog(QtWidgets.QDialog):
         form.addRow("Tally para overlay:", self.cmb_overlay)
 
         # --- opciones geométricas ---
-        self.chk_fixgeom = QtWidgets.QCheckBox("Aplicar corrección geométrica (swap YZ + rotate)")
-        self.chk_fixgeom.setChecked(bool(self.defaults.get("fix_geom", True)))
-        form.addRow("SEG:", self.chk_fixgeom)
+        # GroupBox checkable: si está deseleccionado, no se aplica ninguna transformación
+        geom_group = QtWidgets.QGroupBox("Correcciones geométricas de la SEG")
+        geom_group.setCheckable(True)
+        geom_group.setChecked(bool(self.defaults.get("fix_geom", True)))
+        geom_vlay = QtWidgets.QVBoxLayout(geom_group)
+
+        # Lista interna de transformaciones
+        self._transforms: list[dict] = list(
+            self.defaults.get("transforms", [
+                {"op": "swap_YZ"},
+                {"op": "flip_X"},
+                {"op": "flip_Z"},
+            ])
+        )
+
+        # Widget de lista (drag-to-reorder, double-click to delete)
+        self._transform_list = QtWidgets.QListWidget()
+        self._transform_list.setMaximumHeight(90)
+        self._transform_list.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
+        self._transform_list.setToolTip(
+            "Transformaciones aplicadas en orden.\n"
+            "Arrastrá para reordenar.\nDoble-click para eliminar."
+        )
+        self._transform_list.itemDoubleClicked.connect(self._remove_transform)
+        self._transform_list.model().rowsMoved.connect(self._sync_transforms_from_list)
+        geom_vlay.addWidget(QtWidgets.QLabel(
+            "Secuencia (arrastrar = reordenar · doble-click = quitar):"
+        ))
+        geom_vlay.addWidget(self._transform_list)
+
+        # Botones para agregar operaciones
+        ops_row = QtWidgets.QHBoxLayout()
+        ops_row.addWidget(QtWidgets.QLabel("Agregar:"))
+
+        btn_presets = QtWidgets.QToolButton()
+        btn_presets.setText("Presets ▾")
+        btn_presets.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        preset_menu = QtWidgets.QMenu(btn_presets)
+        preset_menu.addAction(
+            "Por defecto  (swap YZ → flip X → flip Z)",
+            lambda: self._set_transforms([
+                {"op": "swap_YZ"}, {"op": "flip_X"}, {"op": "flip_Z"}
+            ])
+        )
+        preset_menu.addAction("Sin transformaciones",
+                              lambda: self._set_transforms([]))
+        preset_menu.addAction("Solo swap YZ",
+                              lambda: self._set_transforms([{"op": "swap_YZ"}]))
+        btn_presets.setMenu(preset_menu)
+        ops_row.addWidget(btn_presets)
+
+        btn_flips = QtWidgets.QToolButton()
+        btn_flips.setText("Flip ▾")
+        btn_flips.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        flip_menu = QtWidgets.QMenu(btn_flips)
+        for _ax in ("X", "Y", "Z"):
+            _op = f"flip_{_ax}"
+            flip_menu.addAction(f"Flip {_ax}", lambda o=_op: self._add_transform({"op": o}))
+        btn_flips.setMenu(flip_menu)
+        ops_row.addWidget(btn_flips)
+
+        btn_swaps = QtWidgets.QToolButton()
+        btn_swaps.setText("Swap ▾")
+        btn_swaps.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        swap_menu = QtWidgets.QMenu(btn_swaps)
+        for _pair in ("XY", "XZ", "YZ"):
+            _op = f"swap_{_pair}"
+            swap_menu.addAction(f"Swap {_pair}", lambda o=_op: self._add_transform({"op": o}))
+        btn_swaps.setMenu(swap_menu)
+        ops_row.addWidget(btn_swaps)
+
+        btn_rot = QtWidgets.QToolButton()
+        btn_rot.setText("Rot90 ▾")
+        btn_rot.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        rot_menu = QtWidgets.QMenu(btn_rot)
+        for _plane in ("XY", "XZ", "YZ"):
+            for _k, _label in ((1, "+90°"), (2, "180°"), (3, "−90°")):
+                _op = f"rot90_{_plane}"
+                rot_menu.addAction(
+                    f"Rot {_plane} {_label}",
+                    lambda o=_op, kv=_k: self._add_transform({"op": o, "k": kv})
+                )
+        btn_rot.setMenu(rot_menu)
+        ops_row.addWidget(btn_rot)
+        ops_row.addStretch(1)
+        geom_vlay.addLayout(ops_row)
+
+        lay.addWidget(geom_group)
+        self.geom_group = geom_group
+
+        # Poblar la lista con los transforms iniciales
+        self._refresh_transform_list()
 
         # --- set de vectores (subcarpeta) ---
         self.in_set = QtWidgets.QLineEdit()
-        self.in_set.setPlaceholderText("Ej: 2026-02-25_tapita_pix078")
+        self.in_set.setPlaceholderText("Ej: vectores_prueba")
         self.in_set.clear()
         form.addRow("Set de vectores:", self.in_set)
 
@@ -164,11 +371,107 @@ class VectorGenDialog(QtWidgets.QDialog):
         self.in_seg.textChanged.connect(self._update_align_btn)
         self.in_mesh.textChanged.connect(self._update_align_btn)
 
+    # ------------------------------------------------------------------
+    # Helpers: gestión de la lista de transformaciones geométricas
+    # ------------------------------------------------------------------
+
+    def _op_label(self, t: dict) -> str:
+        """Genera la etiqueta legible para un dict de transformación."""
+        op = t.get("op", "?")
+        if op.startswith("rot90_"):
+            k = t.get("k", 1)
+            deg = {1: "+90°", 2: "180°", 3: "−90°"}.get(k % 4, f"{k*90}°")
+            plane = op.split("_")[1]
+            return f"rot90 {plane} {deg}"
+        return op.replace("_", " ")
+
+    def _refresh_transform_list(self):
+        """Reconstruye el QListWidget desde self._transforms."""
+        self._transform_list.clear()
+        for t in self._transforms:
+            self._transform_list.addItem(self._op_label(t))
+
+    def _add_transform(self, t: dict):
+        """Agrega una operación al final de la lista."""
+        self._transforms.append(t)
+        self._transform_list.addItem(self._op_label(t))
+
+    def _remove_transform(self, item: QtWidgets.QListWidgetItem):
+        """Elimina la operación en la posición del item seleccionado."""
+        row = self._transform_list.row(item)
+        if 0 <= row < len(self._transforms):
+            self._transforms.pop(row)
+            self._transform_list.takeItem(row)
+
+    def _set_transforms(self, transforms: list[dict]):
+        """Reemplaza toda la lista de transformaciones."""
+        self._transforms = list(transforms)
+        self._refresh_transform_list()
+
+    def _sync_transforms_from_list(self):
+        """Sincroniza self._transforms con el orden actual del QListWidget
+        después de un drag-to-reorder.
+
+        La lista solo contiene las etiquetas (strings), no los dicts originales,
+        así que reconstruimos el orden a partir de los índices almacenados en
+        los items usando Qt.UserRole.
+        """
+        # Guardamos el índice original en cada item para poder reordenar
+        # self._transforms en consecuencia.
+        # Dado que _refresh_transform_list no almacena el índice, usamos
+        # un approach sencillo: si el usuario reordena, leemos el orden visual
+        # y aplicamos la misma permutación a self._transforms.
+        n = self._transform_list.count()
+        # Reconstruir lista a partir de los labels (búsqueda por label)
+        label_to_dict: dict[str, list[dict]] = {}
+        for t in self._transforms:
+            lbl = self._op_label(t)
+            label_to_dict.setdefault(lbl, []).append(t)
+
+        new_transforms = []
+        counters: dict[str, int] = {}
+        for i in range(n):
+            lbl = self._transform_list.item(i).text()
+            idx = counters.get(lbl, 0)
+            candidates = label_to_dict.get(lbl, [])
+            if idx < len(candidates):
+                new_transforms.append(candidates[idx])
+            counters[lbl] = idx + 1
+
+        self._transforms = new_transforms
+
+    def _get_active_transforms(self) -> list[dict]:
+        """Retorna la lista de transforms si el grupo está activo, si no []."""
+        if not self.geom_group.isChecked():
+            return []
+        return list(self._transforms)
+
     def _load_bu(self):
         """
-        Carga bnct_union.py dinámicamente (mismo mecanismo que _run_pipeline).
+        Carga bnct_union con la siguiente prioridad:
+
+        1. Como módulo del paquete: ratmaster.physics.bnct_union
+           (cuando bnct_union.py está en ratmaster/physics/)
+        2. Carga dinámica desde el filesystem (comportamiento original):
+           busca bnct_union.py en app_install_dir(), su padre, y user_app_dir()
+
         Retorna el módulo, o None si no se encontró (ya muestra el error al usuario).
         """
+        # --- Intento 1: import como parte del paquete ---
+        try:
+            import importlib
+            bu = importlib.import_module("ratmaster.physics.bnct_union")
+            return bu
+        except ModuleNotFoundError:
+            pass   # no está en physics/, intentar la carga dinámica
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "bnct_union — Error al importar",
+                f"Se encontró ratmaster.physics.bnct_union pero falló al cargarlo:\n{e}"
+            )
+            return None
+
+        # --- Intento 2: carga dinámica por path (compatibilidad) ---
         import importlib.util
 
         search_dirs = [
@@ -195,10 +498,11 @@ class VectorGenDialog(QtWidgets.QDialog):
         paths_tried = "\n".join(f"  • {d / 'bnct_union.py'}" for d in search_dirs)
         QtWidgets.QMessageBox.critical(
             self, "bnct_union no encontrado",
-            "No se encontró bnct_union.py en ninguna de estas ubicaciones:\n\n"
+            "No se encontró bnct_union en ninguna de estas ubicaciones:\n\n"
+            "  • ratmaster/physics/bnct_union.py  (como módulo del paquete)\n"
             f"{paths_tried}\n\n"
-            "Colocá bnct_union.py en la misma carpeta donde está la carpeta "
-            "ratmaster/ (o junto al ejecutable RatMaster.exe)."
+            "Colocá bnct_union.py en ratmaster/physics/ "
+            "o en la misma carpeta donde está RatMaster.py."
         )
         return None
 
@@ -253,10 +557,14 @@ class VectorGenDialog(QtWidgets.QDialog):
         # Mostrar cursor de espera mientras carga
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            Seg    = bu.load_seg_with_lut(seg_path, pixel_size_mm=voxel_size_mm)
+            Seg    = bu.load_seg_auto(seg_path, pixel_size_mm=voxel_size_mm)
             segM   = Seg["Matrix"]
-            if self.chk_fixgeom.isChecked():
-                segM = bu.rotate_segmentation(bu.swap_YZ(segM))
+            transforms = self._get_active_transforms()
+            if transforms:
+                segM, new_vs = bu.apply_seg_transforms_with_voxelsize(
+                    segM, Seg["VoxelSize_mm"], transforms
+                )
+                Seg["VoxelSize_mm"] = new_vs
             meshes = bu.read_meshtal_all(meshtal_path)
         except Exception as e:
             QtWidgets.QApplication.restoreOverrideCursor()
@@ -291,7 +599,7 @@ class VectorGenDialog(QtWidgets.QDialog):
             self,
             "Elegir segmentación",
             str(self.base_folder),
-            "SEG (*.seg);;Todos (*.*)"
+            "Segmentación (*.seg *.tif *.tiff);;SEG (*.seg);;TIFF (*.tif *.tiff);;Todos (*.*)"
         )
         if fn:
             self.in_seg.setText(fn)
@@ -301,7 +609,7 @@ class VectorGenDialog(QtWidgets.QDialog):
             self,
             "Elegir meshtal",
             str(self.base_folder),
-            "Meshtal (*.msh *.meshtal *.txt);;Todos (*.*)"
+            "Meshtal (*.msh *.msht *.meshtal *.txt);;Todos (*.*)"
         )
         if fn:
             self.in_mesh.setText(fn)
@@ -448,36 +756,95 @@ class VectorGenDialog(QtWidgets.QDialog):
             )
 
             # --- 1) SEG ---
+            # Para archivos TIFF, primero se pide al usuario que asigne nombres
+            # a las etiquetas detectadas (el TIFF no tiene metadatos de materiales).
+            # Para .seg se usa el lector binario original que ya incluye los nombres.
+            ext_seg = Path(seg_path).suffix.lower()
+            tiff_material_names: list[str] | None = None
+
+            if ext_seg in (".tif", ".tiff"):
+                # Leer solo el array para detectar etiquetas únicas antes de mostrar el diálogo
+                self._set_busy_message(
+                    busy,
+                    "Detectando etiquetas en el TIFF…"
+                )
+                try:
+                    import tifffile
+                    with tifffile.TiffFile(seg_path) as _tif:
+                        _data_preview = _tif.asarray()
+                    _unique_labels = sorted(int(v) for v in np.unique(_data_preview))
+                except ImportError:
+                    QtWidgets.QMessageBox.critical(
+                        self, "Dependencia faltante",
+                        "Se requiere 'tifffile' para leer archivos TIFF.\n"
+                        "Instalalo con:  pip install tifffile"
+                    )
+                    return
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(
+                        self, "SEG",
+                        f"No se pudo pre-leer el TIFF para detectar etiquetas:\n{e}"
+                    )
+                    return
+
+                # Mostrar diálogo de asignación de nombres (fuera del cursor de espera)
+                if busy is not None:
+                    busy.hide()
+                QtWidgets.QApplication.restoreOverrideCursor()
+
+                lbl_dlg = TiffLabelDialog(self, _unique_labels)
+                if lbl_dlg.exec() != QtWidgets.QDialog.Accepted:
+                    # Usuario canceló la asignación de etiquetas → abortar pipeline
+                    if busy is not None:
+                        busy.show()
+                    QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+                    return
+
+                tiff_material_names = lbl_dlg.get_material_names()
+
+                # Restaurar indicador de progreso
+                QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+                if busy is not None:
+                    busy.show()
+                    QtWidgets.QApplication.processEvents()
+
             self._set_busy_message(
                 busy,
-                "Leyendo la segmentación (.seg)…\n\nSe están generando los nuevos vectores de dosis. Esperá por favor."
+                "Leyendo la segmentación…\n\nSe están generando los nuevos vectores de dosis. Esperá por favor."
             )
             try:
-                Seg = bu.load_seg_with_lut(seg_path, pixel_size_mm=voxel_size_mm)
+                # load_seg_auto elige automáticamente entre load_seg_with_lut
+                # (para .seg) y load_tif_with_lut (para .tif/.tiff).
+                Seg = bu.load_seg_auto(
+                    seg_path,
+                    pixel_size_mm=voxel_size_mm,
+                    material_names=tiff_material_names,   # None para .seg (no se usa)
+                )
                 segM = Seg["Matrix"]
                 lut = Seg["LUT"]
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "SEG", f"No se pudo leer la segmentación:\n{e}")
                 return
 
-            # corrección geométrica opcional (igual a tu demo)
-            self._set_busy_message(
-                busy,
-                "Aplicando corrección geométrica de la segmentación…\n\nSwap/rotate en progreso."
-            )
-            try:
-                if self.chk_fixgeom.isChecked():
-                    segM = bu.swap_YZ(segM)
-                    sx, sy, sz = Seg["VoxelSize_mm"]
-                    Seg["VoxelSize_mm"] = (sx, sz, sy)
-                    segM = bu.rotate_segmentation(segM)
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "SEG",
-                    f"Error aplicando corrección geométrica:\n{e}"
+            # corrección geométrica configurable
+            transforms = self._get_active_transforms()
+            if transforms:
+                self._set_busy_message(
+                    busy,
+                    "Aplicando correcciones geométricas de la segmentación…\n\nTransformaciones en progreso."
                 )
-                return
+                try:
+                    segM, new_vs = bu.apply_seg_transforms_with_voxelsize(
+                        segM, Seg["VoxelSize_mm"], transforms
+                    )
+                    Seg["VoxelSize_mm"] = new_vs
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(
+                        self,
+                        "SEG",
+                        f"Error aplicando correcciones geométricas:\n{e}"
+                    )
+                    return
 
             # --- 2) MESHS ---
             self._set_busy_message(
@@ -501,7 +868,7 @@ class VectorGenDialog(QtWidgets.QDialog):
             try:
                 organ_dose = bu.calcular_dosis_por_organo_trilineal(
                     segM=segM,
-                    voxel_size_mm=Seg["VoxelSize_mm"],
+                    voxel_size_mm=voxel_size_mm,  # original de la UI: vx/vy/vz son para X/Y/Z de la mesh
                     origin_mesh_cm=origin_mesh_cm,
                     meshes=meshes,
                     lut=lut,
@@ -516,15 +883,12 @@ class VectorGenDialog(QtWidgets.QDialog):
                 # Normalizar nombres para que matchee RatMaster (VectorDoseRate<Organ>.mat)
                 # - quitar espacios / guiones / underscores
                 # - remover tildes
-                import unicodedata
-                import re as _re
-
                 def _norm_key(s: str) -> str:
                     s = str(s).strip()
                     s = unicodedata.normalize("NFKD", s)
                     s = "".join(ch for ch in s if not unicodedata.combining(ch))
-                    s = _re.sub(r"[\s_\-]+", "", s)
-                    s = _re.sub(r"[^0-9A-Za-z]", "", s)
+                    s = re.sub(r"[\s_\-]+", "", s)
+                    s = re.sub(r"[^0-9A-Za-z]", "", s)
                     return s
 
                 organ_dose_norm = {_norm_key(k): v for k, v in organ_dose.items()}
@@ -564,9 +928,8 @@ class VectorGenDialog(QtWidgets.QDialog):
                             organ_names_ordered.append(norm_name)
 
                     np.savez_compressed(str(out_folder / "_viz_data.npz"), **save_dict)
-                    import json as _json
                     (out_folder / "_viz_organ_names.json").write_text(
-                        _json.dumps(organ_names_ordered, ensure_ascii=False),
+                        json.dumps(organ_names_ordered, ensure_ascii=False),
                         encoding="utf-8",
                     )
                 except Exception as _ve:
@@ -575,24 +938,36 @@ class VectorGenDialog(QtWidgets.QDialog):
 
                 # --- 3b) Trazabilidad ---
                 try:
+                    # Nombre del archivo SEG (sin path completo para portabilidad)
+                    seg_name = Path(seg_path).name
+                    meshtal_name = Path(meshtal_path).name
+
                     meta = {
                         "created_at": datetime.now().isoformat(timespec="seconds"),
                         "vector_set": vector_set,
+                        # Archivos fuente
                         "seg_path": str(Path(seg_path).resolve()),
+                        "seg_filename": seg_name,
                         "meshtal_path": str(Path(meshtal_path).resolve()),
-                        "voxel_size_mm": [float(x) for x in Seg["VoxelSize_mm"]],
+                        "meshtal_filename": meshtal_name,
+                        # Parámetros de generación
+                        "voxel_size_mm_input": [float(x) for x in voxel_size_mm],
+                        "voxel_size_mm_after_transforms": [float(x) for x in Seg["VoxelSize_mm"]],
                         "origin_mesh_cm": [float(x) for x in origin_mesh_cm],
                         "factor_spnd": float(factor_spnd),
+                        # Tallies
                         "tallies": [int(t) for t in tallies],
                         "tally_overlay": int(tally_overlay),
-                        "fix_geom": bool(self.chk_fixgeom.isChecked()),
+                        # Transformaciones geométricas aplicadas a la SEG
+                        "geom_transforms_enabled": self.geom_group.isChecked(),
+                        "geom_transforms": transforms,   # lista de dicts con "op" (y "k" si rot90)
                     }
                     (out_folder / "_meta.json").write_text(
                         json.dumps(meta, indent=2, ensure_ascii=False),
                         encoding="utf-8"
                     )
-                except Exception:
-                    pass
+                except Exception as _me:
+                    print(f"[WARN] No se pudo guardar _meta.json: {_me}")
 
             except Exception as e:
                 QtWidgets.QMessageBox.critical(
@@ -611,6 +986,7 @@ class VectorGenDialog(QtWidgets.QDialog):
                 self._show_overlay(
                     segM=segM,
                     Seg=Seg,
+                    voxel_size_mm=voxel_size_mm,
                     origin_mesh_cm=origin_mesh_cm,
                     meshes=meshes,
                     tally=tally_overlay,
@@ -651,9 +1027,15 @@ class VectorGenDialog(QtWidgets.QDialog):
                 except Exception:
                     pass
 
-    def _show_overlay(self, segM, Seg, origin_mesh_cm, meshes, tally: int, bu, save_path: Path | None = None):
+    def _show_overlay(self, segM, Seg, origin_mesh_cm, meshes, tally: int, bu,
+                      voxel_size_mm=None, save_path: Path | None = None):
         import numpy as np
         import matplotlib.pyplot as plt
+
+        # voxel_size_mm es el valor original de la UI: vx/vy/vz corresponden
+        # directamente a X/Y/Z de la mesh. Si no se pasa, se usa Seg["VoxelSize_mm"]
+        # como fallback (compatibilidad con llamadas antiguas sin el parámetro).
+        vs_mm = voxel_size_mm if voxel_size_mm is not None else Seg["VoxelSize_mm"]
 
         if tally not in meshes:
             # si no está, tomar el primero disponible
@@ -670,9 +1052,9 @@ class VectorGenDialog(QtWidgets.QDialog):
         cz, M = bu._ensure_increasing_axis(cz, M, axis_index=2)
 
         nx, ny, nz = segM.shape
-        xs = bu.seg_phys_coords_1d(nx, Seg["VoxelSize_mm"][0], origin_mesh_cm[0])
-        ys = bu.seg_phys_coords_1d(ny, Seg["VoxelSize_mm"][1], origin_mesh_cm[1])
-        zs = bu.seg_phys_coords_1d(nz, Seg["VoxelSize_mm"][2], origin_mesh_cm[2])
+        xs = bu.seg_phys_coords_1d(nx, vs_mm[0], origin_mesh_cm[0])
+        ys = bu.seg_phys_coords_1d(ny, vs_mm[1], origin_mesh_cm[1])
+        zs = bu.seg_phys_coords_1d(nz, vs_mm[2], origin_mesh_cm[2])
 
         counts = np.sum(segM > 0, axis=(0, 1))
         k_seg = int(np.argmax(counts))
