@@ -45,7 +45,7 @@ from ratmaster.physics.isoe import (
     auto_assign_presets, build_params_by_organ, get_t0_map_for_preset,
 )
 from ratmaster.constants import USER_ISOE_PRESETS, _is_builtin_isoe_preset
-from ratmaster.app_paths import ensure_user_json
+from ratmaster.data.persistence import save_user_isoe_presets
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1017,6 +1017,9 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
         }
         ISOE_PARAM_PRESETS[name] = new_preset
         USER_ISOE_PRESETS[name]  = new_preset
+        ok_disk, err = save_user_isoe_presets(USER_ISOE_PRESETS)
+        if not ok_disk:
+            QtWidgets.QMessageBox.warning(self, "IsoE", f"No se pudo guardar en disco:\n{err}")
         self._selected = name
         self._reload_combo(self._cmb_filter.currentData() or "")
         self._cmb_preset.blockSignals(True)
@@ -1036,6 +1039,9 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
             return
         ISOE_PARAM_PRESETS.pop(name, None)
         USER_ISOE_PRESETS.pop(name, None)
+        ok_disk, err = save_user_isoe_presets(USER_ISOE_PRESETS)
+        if not ok_disk:
+            QtWidgets.QMessageBox.warning(self, "IsoE", f"No se pudo guardar en disco:\n{err}")
         self._selected = "Manual"
         self._reload_combo(self._cmb_filter.currentData() or "")
         self._cmb_preset.blockSignals(True)

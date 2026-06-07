@@ -545,6 +545,39 @@ def _ensure_increasing_axis(axis_vals: np.ndarray, M: np.ndarray, axis_index: in
 
 
 # ===========================
+# Helper interno: interpolación robusta para valores muy pequeños
+# ===========================
+def _safe_interp(cx: np.ndarray, cy: np.ndarray, cz: np.ndarray,
+                 M: np.ndarray, pts: np.ndarray, method: str) -> np.ndarray:
+    """
+    Interpolación 3D robusta frente a underflow numérico.
+
+    RegularGridInterpolator devuelve cero cuando los valores del array son
+    del orden de 1e-22 o menores (underflow interno de scipy). La solución
+    es escalar M por su máximo antes de interpolar y desescalar el resultado.
+
+    Args:
+        cx, cy, cz : arrays 1D de centros de la mesh (deben ser crecientes).
+        M          : array (nx, ny, nz) de valores a interpolar.
+        pts        : array (N, 3) de puntos donde interpolar (en cm).
+        method     : "linear" o "cubic".
+
+    Retorna array (N,) con los valores interpolados.
+    """
+    M = np.asarray(M, dtype=np.float64)
+    scale = np.abs(M).max()
+    if scale == 0.0:
+        return np.zeros(len(pts), dtype=np.float64)
+    interp = RegularGridInterpolator(
+        (cx, cy, cz),
+        M / scale,
+        method=method,
+        bounds_error=True,
+    )
+    return interp(pts) * scale
+
+
+# ===========================
 # Interpolación trilineal con manejo correcto de dominio
 # ===========================
 def calcular_dosis_por_organo_trilineal(segM: np.ndarray,
@@ -552,7 +585,8 @@ def calcular_dosis_por_organo_trilineal(segM: np.ndarray,
                                         origin_mesh_cm,
                                         meshes: dict,
                                         lut: dict,
-                                        factor_spnd: float):
+                                        factor_spnd: float,
+                                        method: str = "linear"):
     """
     Calcula dosis e incertidumbre MCNP por vóxel para cada órgano de la segmentación.
 
@@ -579,6 +613,18 @@ def calcular_dosis_por_organo_trilineal(segM: np.ndarray,
         meshes:         dict de read_meshtal_all — debe tener 'ErrorMatrix'
         lut:            dict label -> nombre de órgano
         factor_spnd:    factor de conversión de unidades (ver comentario en el código)
+        method:         método de interpolación espacial:
+                          "linear" (default) — interpolación trilineal, equivalente
+                                               al comportamiento original.
+                          "cubic"            — interpolación tricúbica; reduce errores
+                                               en zonas de alto gradiente (especialmente
+                                               neutrones rápidos y bordes del fantoma).
+                                               Requiere scipy ≥ 1.9 y mesh con ≥ 4 bins
+                                               en cada dirección.
+                        Nota: ambos métodos aplican escalado automático antes de
+                        interpolar para evitar underflow numérico con valores ≤ 1e-22.
+                        El error relativo MCNP se interpola siempre con "linear"
+                        independientemente del valor de este parámetro.
 
     Notas sobre factor_spnd:
         dosis = tally_val / factor_spnd
@@ -586,6 +632,21 @@ def calcular_dosis_por_organo_trilineal(segM: np.ndarray,
         Ejemplo: si tally en [Gy·cm²/partícula] y factor_spnd en [n/(cm²·s)],
                  resultado en [Gy/s por unidad de flujo de referencia].
     """
+    import warnings
+    # Verificar soporte cúbico si se solicita
+    if method == "cubic":
+        try:
+            _x = np.linspace(0, 1, 4)
+            _t = RegularGridInterpolator((_x, _x, _x), np.ones((4, 4, 4)), method="cubic")
+            _t(np.array([[0.5, 0.5, 0.5]]))
+        except (ValueError, NotImplementedError):
+            warnings.warn(
+                "RegularGridInterpolator no soporta method='cubic' en 3D con esta "
+                "versión de scipy. Se usará 'linear'. "
+                "Actualizá con: pip install --upgrade scipy",
+                stacklevel=2,
+            )
+            method = "linear"
     labels = np.unique(segM)
     labels = labels[labels > 0]
 
@@ -653,33 +714,35 @@ def calcular_dosis_por_organo_trilineal(segM: np.ndarray,
         # ── Interpolar valor y error para cada tally ─────────────────────────
         for tally, (cx, cy, cz, M, E) in oriented_meshes.items():
 
-            # bounds_error=True: si el filtrado es correcto nunca debería saltar.
-            # Si salta, es un bug en la máscara (mejor que silenciosamente extrapolar).
-            interp_val = RegularGridInterpolator(
-                (cx, cy, cz), M,
-                method="linear",
-                bounds_error=True,
-            )
+            # Verificar tamaño mínimo para cúbico (necesita ≥ 4 puntos por eje)
+            eff_method = method
+            if method == "cubic" and min(M.shape) < 4:
+                import warnings
+                warnings.warn(
+                    f"Tally {tally}: la mesh tiene shape {M.shape}. "
+                    "El método cúbico requiere ≥ 4 puntos por eje. "
+                    "Se usará 'linear' para este tally.",
+                    stacklevel=2,
+                )
+                eff_method = "linear"
 
-            tally_vals = interp_val(pts_valid).astype(np.float64)
+            # Interpolación con escalado automático (evita underflow con valores ≤ 1e-22)
+            tally_vals = _safe_interp(cx, cy, cz, M, pts_valid, eff_method)
 
             # Aplicar factor de conversión de unidades (ver docstring)
             dosis = np.clip(tally_vals / float(factor_spnd), 0.0, None)
             organ_dose[organ_name][int(tally)] = dosis
 
-            # Interpolar el error relativo MCNP si está disponible
-            # El Rel Error se interpola directamente (aproximación válida cuando
-            # el campo varía suavemente; conservadora en regiones de alto gradiente).
+            # El error relativo se interpola siempre con "linear":
+            # varía más suavemente que el flujo y el cúbico puede generar
+            # oscilaciones espurias en regiones de bajo conteo estadístico.
             if E is not None:
-                interp_err = RegularGridInterpolator(
-                    (cx, cy, cz), E,
-                    method="linear",
-                    bounds_error=True,
-                )
-                err_vals = np.clip(interp_err(pts_valid).astype(np.float64), 0.0, None)
+                err_vals = _safe_interp(cx, cy, cz, E, pts_valid, "linear")
+                err_vals = np.clip(err_vals, 0.0, None)
                 organ_dose[organ_name][f"{int(tally)}_err"] = err_vals
 
-        print(f"Calculada dosis para '{organ_name}' (label={int(label)}): "
+        print(f"Calculada dosis para '{organ_name}' "
+              f"(label={int(label)}, método={eff_method}): "
               f"{n_valid}/{N_total} vóxeles válidos")
 
     return organ_dose

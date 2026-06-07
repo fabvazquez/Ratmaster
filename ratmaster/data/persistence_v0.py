@@ -6,17 +6,13 @@ Persistencia de configuración y datos de usuario de RatMaster.
 Incluye:
   - DEFAULT_SPND_REGISTRY: detectores SPND con factores de calibración y sensibilidad.
   - load_spnd_registry() / save_spnd_registry(): lectura/escritura del registry JSON.
-  - load_user_boro_protocols() / save_user_boro_protocols(): protocolos de boro del usuario.
-  - load_user_constraint_presets() / save_user_constraint_presets(): constraints del usuario.
-  - load_user_isoe_presets() / save_user_isoe_presets(): presets IsoE del usuario.
   - parse_number_or_pair(): parseo robusto de "4.32 ± 0.01" desde entrada de usuario.
 
 Los archivos JSON se guardan en %APPDATA%\\RatMaster\\ (ver app_paths.py).
 """
 
 import json
-import numpy as np
-from ratmaster.app_paths import ensure_user_json, user_writable_path
+from ratmaster.app_paths import ensure_user_json
 
 
 # ── Registry de detectores SPND ───────────────────────────────────────────────
@@ -93,6 +89,7 @@ def load_spnd_registry() -> dict:
                 return data
         except Exception:
             pass
+    # Fallback: copia del default (deep copy para evitar mutaciones)
     return json.loads(json.dumps(DEFAULT_SPND_REGISTRY))
 
 
@@ -107,143 +104,6 @@ def save_spnd_registry(reg: dict) -> tuple[bool, str]:
     p = _registry_path()
     try:
         p.write_text(json.dumps(reg, indent=2, ensure_ascii=False), encoding="utf-8")
-        return True, ""
-    except Exception as e:
-        return False, str(e)
-
-
-# ── Protocolos de boro del usuario ────────────────────────────────────────────
-#
-# Archivo: %APPDATA%\RatMaster\user_boro_protocols.json
-# Formato: { "nombre": { "ref": str, "B_ppm": [...], "B_err": [...] }, ... }
-
-_BORO_FILE = "user_boro_protocols.json"
-
-
-def load_user_boro_protocols() -> dict:
-    """
-    Carga los protocolos de boro definidos por el usuario desde el JSON del usuario.
-    Devuelve un dict vacío si el archivo no existe o está corrupto.
-    """
-    p = ensure_user_json(_BORO_FILE, {})
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    return {}
-
-
-def save_user_boro_protocols(protocols: dict) -> tuple[bool, str]:
-    """
-    Guarda el dict completo de protocolos de boro del usuario en disco.
-
-    Args:
-        protocols: dict con todos los protocolos de usuario
-                   (solo los de usuario, no los builtin).
-
-    Returns:
-        (True, "") si fue exitoso.
-        (False, mensaje_de_error) si falló.
-    """
-    p = user_writable_path(_BORO_FILE)
-    try:
-        p.write_text(json.dumps(protocols, indent=2, ensure_ascii=False), encoding="utf-8")
-        return True, ""
-    except Exception as e:
-        return False, str(e)
-
-
-# ── Presets de constraints del usuario ───────────────────────────────────────
-#
-# Archivo: %APPDATA%\RatMaster\user_constraint_presets.json
-# Formato: { "nombre": [[fila0], [fila1], ..., [fila4]], ... }
-# (matrices serializadas como lista de listas para JSON)
-
-_CONSTRAINTS_FILE = "user_constraint_presets.json"
-
-
-def load_user_constraint_presets() -> dict[str, np.ndarray]:
-    """
-    Carga los presets de constraints definidos por el usuario.
-    Devuelve un dict {nombre: np.ndarray shape (5, N_organs)}.
-    Entradas con forma incorrecta se omiten silenciosamente.
-    """
-    from ratmaster.constants import _constraints_matrix_from_serializable
-    p = ensure_user_json(_CONSTRAINTS_FILE, {})
-    result: dict[str, np.ndarray] = {}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return result
-        for name, raw in data.items():
-            try:
-                result[name] = _constraints_matrix_from_serializable(raw)
-            except Exception:
-                pass  # entrada malformada: se omite
-    except Exception:
-        pass
-    return result
-
-
-def save_user_constraint_presets(presets: dict[str, np.ndarray]) -> tuple[bool, str]:
-    """
-    Guarda el dict completo de presets de constraints del usuario en disco.
-    Las matrices numpy se serializan como lista de listas.
-
-    Returns:
-        (True, "") si fue exitoso.
-        (False, mensaje_de_error) si falló.
-    """
-    p = user_writable_path(_CONSTRAINTS_FILE)
-    try:
-        serializable = {
-            name: mat.tolist()
-            for name, mat in presets.items()
-            if isinstance(mat, np.ndarray)
-        }
-        p.write_text(json.dumps(serializable, indent=2, ensure_ascii=False), encoding="utf-8")
-        return True, ""
-    except Exception as e:
-        return False, str(e)
-
-
-# ── Presets IsoE del usuario ──────────────────────────────────────────────────
-#
-# Archivo: %APPDATA%\RatMaster\user_isoe_presets.json
-# Formato: mismo que ISOE_PARAM_PRESETS en physics/isoe.py
-# (dicts con "params", "t0_map", "tissue_type", "ref", etc.)
-
-_ISOE_FILE = "user_isoe_presets.json"
-
-
-def load_user_isoe_presets() -> dict:
-    """
-    Carga los presets IsoE definidos por el usuario.
-    Devuelve un dict vacío si el archivo no existe o está corrupto.
-    """
-    p = ensure_user_json(_ISOE_FILE, {})
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    return {}
-
-
-def save_user_isoe_presets(presets: dict) -> tuple[bool, str]:
-    """
-    Guarda el dict completo de presets IsoE del usuario en disco.
-
-    Returns:
-        (True, "") si fue exitoso.
-        (False, mensaje_de_error) si falló.
-    """
-    p = user_writable_path(_ISOE_FILE)
-    try:
-        p.write_text(json.dumps(presets, indent=2, ensure_ascii=False), encoding="utf-8")
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -285,6 +145,7 @@ def parse_number_or_pair(text: str) -> tuple[float | None, float | None]:
     if not t:
         return None, None
 
+    # Normalizar símbolo de incertidumbre
     t = t.replace("±", "+/-")
 
     if "+/-" in t:
@@ -296,6 +157,7 @@ def parse_number_or_pair(text: str) -> tuple[float | None, float | None]:
         except Exception:
             return None, None
 
+    # Sin incertidumbre: solo el valor
     t = _normalize_num_text(t)
     try:
         return float(t), None

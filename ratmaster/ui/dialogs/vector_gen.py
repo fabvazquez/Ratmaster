@@ -152,13 +152,32 @@ class VectorGenDialog(QtWidgets.QDialog):
     def __init__(self, parent, base_folder: Path, defaults: dict | None = None):
         super().__init__(parent)
         self.setWindowTitle("Generar vectores de dosis (SEG + Meshtal MCNP)")
-        self.resize(760, 420)
+        self.setMinimumSize(580, 360)
+        self.resize(780, 560)
+        self.setSizeGripEnabled(True)
         self.base_folder = Path(base_folder).resolve()
         self.defaults = defaults or {}
 
         self._result = None  # dict con paths/params + outputs
 
-        lay = QtWidgets.QVBoxLayout(self)
+        # Layout raíz: scroll arriba + botones fijos abajo
+        root_lay = QtWidgets.QVBoxLayout(self)
+        root_lay.setContentsMargins(0, 0, 0, 8)
+        root_lay.setSpacing(0)
+
+        # ── Scroll area que contiene todo el formulario ──────────────────
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+
+        _content = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(_content)
+        lay.setContentsMargins(12, 10, 12, 6)
+        lay.setSpacing(6)
+        scroll.setWidget(_content)
+        root_lay.addWidget(scroll, stretch=1)
 
         form = QtWidgets.QFormLayout()
         lay.addLayout(form)
@@ -215,6 +234,32 @@ class VectorGenDialog(QtWidgets.QDialog):
         self.in_factor = QtWidgets.QLineEdit(str(self.defaults.get("factor_spnd", 3.6006e-9)))
         self.in_factor.setMaximumWidth(160)
         form.addRow("Factor SPND (ver bnct_union):", self.in_factor)
+
+        # --- método de interpolación ---
+        interp_row = QtWidgets.QHBoxLayout()
+        self.rb_lineal = QtWidgets.QRadioButton("Lineal")
+        self.rb_cubico = QtWidgets.QRadioButton("Cúbica")
+        default_interp = self.defaults.get("interp_method", "linear")
+        if default_interp == "cubic":
+            self.rb_cubico.setChecked(True)
+        else:
+            self.rb_lineal.setChecked(True)
+        interp_grp = QtWidgets.QButtonGroup(self)
+        interp_grp.addButton(self.rb_lineal)
+        interp_grp.addButton(self.rb_cubico)
+        interp_row.addWidget(self.rb_lineal)
+        interp_row.addWidget(self.rb_cubico)
+        interp_row.addSpacing(12)
+        self._lbl_interp_note = QtWidgets.QLabel(
+            "La interpolación cúbica reduce errores en zonas de alto gradiente "
+            "(neutrones rápidos, bordes). Requiere scipy ≥ 1.9."
+        )
+        self._lbl_interp_note.setStyleSheet("color: #666; font-size: 11px;")
+        self._lbl_interp_note.setWordWrap(True)
+        interp_row.addWidget(self._lbl_interp_note, stretch=1)
+        w_interp = QtWidgets.QWidget()
+        w_interp.setLayout(interp_row)
+        form.addRow("Interpolación:", w_interp)
 
         # --- tallies ---
         self.in_tallies = QtWidgets.QLineEdit(
@@ -344,24 +389,35 @@ class VectorGenDialog(QtWidgets.QDialog):
         )
         note.setStyleSheet("color: #555;")
         lay.addWidget(note)
+        lay.addStretch(1)   # empuja el contenido hacia arriba dentro del scroll
 
-        # --- botones ---
-        btns = QtWidgets.QHBoxLayout()
-        self.btn_run = QtWidgets.QPushButton("Generar")
-        self.btn_run.setStyleSheet("font-weight: bold; padding: 8px;")
+        # ── Separador + botones fijos (fuera del scroll, siempre visibles) ──
+        sep = QtWidgets.QFrame()
+        sep.setFrameShape(QtWidgets.QFrame.HLine)
+        sep.setFrameShadow(QtWidgets.QFrame.Sunken)
+        root_lay.addWidget(sep)
+
+        btns_widget = QtWidgets.QWidget()
+        btns = QtWidgets.QHBoxLayout(btns_widget)
+        btns.setContentsMargins(12, 6, 12, 4)
+        self.btn_run = QtWidgets.QPushButton("\u2699  Generar")
+        self.btn_run.setStyleSheet("font-weight: bold; padding: 7px 18px;")
+        self.btn_run.setDefault(True)
         btn_cancel = QtWidgets.QPushButton("Cancelar")
-        self.btn_align = QtWidgets.QPushButton("🔍  Ver alineación")
+        btn_cancel.setStyleSheet("padding: 7px 14px;")
+        self.btn_align = QtWidgets.QPushButton("\U0001f50d  Ver alineaci\u00f3n")
+        self.btn_align.setStyleSheet("padding: 7px 14px;")
         self.btn_align.setToolTip(
-            "Abre el visor interactivo de superposición SEG ↔ Mesh para\n"
-            "verificar la alineación antes o después de generar vectores.\n"
-            "Requiere que los archivos SEG y meshtal estén seleccionados."
+            "Abre el visor interactivo de superposici\u00f3n SEG \u2194 Mesh para\n"
+            "verificar la alineaci\u00f3n antes o despu\u00e9s de generar vectores.\n"
+            "Requiere que los archivos SEG y meshtal est\u00e9n seleccionados."
         )
         self.btn_align.setEnabled(False)   # se habilita cuando ambos archivos existen
         btns.addStretch(1)
         btns.addWidget(self.btn_run)
         btns.addWidget(self.btn_align)
         btns.addWidget(btn_cancel)
-        lay.addLayout(btns)
+        root_lay.addWidget(btns_widget)
 
         btn_cancel.clicked.connect(self.reject)
         self.btn_run.clicked.connect(self._run_pipeline)
@@ -370,6 +426,7 @@ class VectorGenDialog(QtWidgets.QDialog):
         # Habilitar btn_align en tiempo real cuando ambos campos tienen texto
         self.in_seg.textChanged.connect(self._update_align_btn)
         self.in_mesh.textChanged.connect(self._update_align_btn)
+        self._update_align_btn()
 
     # ------------------------------------------------------------------
     # Helpers: gestión de la lista de transformaciones geométricas
@@ -861,18 +918,22 @@ class VectorGenDialog(QtWidgets.QDialog):
                 return
 
             # --- 3) Pipeline: dosis por órgano + export .mat ---
+            interp_method = "cubic" if self.rb_cubico.isChecked() else "linear"
+            interp_label  = "cúbica" if interp_method == "cubic" else "lineal"
             self._set_busy_message(
                 busy,
-                "Calculando dosis por órgano…\n\nUniendo segmentación y mesh. Este paso puede tardar."
+                f"Calculando dosis por órgano (interpolación {interp_label})…"
+                "\n\nUniendo segmentación y mesh. Este paso puede tardar."
             )
             try:
                 organ_dose = bu.calcular_dosis_por_organo_trilineal(
                     segM=segM,
-                    voxel_size_mm=voxel_size_mm,  # original de la UI: vx/vy/vz son para X/Y/Z de la mesh
+                    voxel_size_mm=voxel_size_mm,
                     origin_mesh_cm=origin_mesh_cm,
                     meshes=meshes,
                     lut=lut,
-                    factor_spnd=factor_spnd
+                    factor_spnd=factor_spnd,
+                    method=interp_method,
                 )
 
                 self._set_busy_message(
@@ -955,6 +1016,8 @@ class VectorGenDialog(QtWidgets.QDialog):
                         "voxel_size_mm_after_transforms": [float(x) for x in Seg["VoxelSize_mm"]],
                         "origin_mesh_cm": [float(x) for x in origin_mesh_cm],
                         "factor_spnd": float(factor_spnd),
+                        # Interpolación
+                        "interp_method": interp_method,
                         # Tallies
                         "tallies": [int(t) for t in tallies],
                         "tally_overlay": int(tally_overlay),

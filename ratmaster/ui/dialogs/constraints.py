@@ -14,7 +14,7 @@ from ratmaster.constants import (
     ORG_ORDER, CONSTRAINT_PRESETS, USER_CONSTRAINT_PRESETS,
     _make_constraints_matrix, _is_builtin_constraint_preset,
 )
-from ratmaster.data.persistence import parse_number_or_pair
+from ratmaster.data.persistence import parse_number_or_pair, save_user_constraint_presets
 
 
 class PasteableTable(QtWidgets.QTableWidget):
@@ -193,6 +193,10 @@ class ConstraintsDialog(QtWidgets.QDialog):
             if QtWidgets.QMessageBox.question(self, "Sobrescribir", f"Ya existe '{name}'. ¿Sobrescribirlo?") != QtWidgets.QMessageBox.Yes:
                 return
         CONSTRAINT_PRESETS[name] = mat.copy()
+        USER_CONSTRAINT_PRESETS[name] = mat.copy()
+        ok_disk, err = save_user_constraint_presets(USER_CONSTRAINT_PRESETS)
+        if not ok_disk:
+            QtWidgets.QMessageBox.warning(self, "Restriciones de Dosis", f"No se pudo guardar en disco:\n{err}")
         self._selected_name = name
         self._reload_combo()
         self.cmb_preset.setCurrentText(name)
@@ -209,6 +213,10 @@ class ConstraintsDialog(QtWidgets.QDialog):
         if QtWidgets.QMessageBox.question(self, "Borrar preset", f"¿Borrar el preset '{name}'?") != QtWidgets.QMessageBox.Yes:
             return
         CONSTRAINT_PRESETS.pop(name, None)
+        USER_CONSTRAINT_PRESETS.pop(name, None)
+        ok_disk, err = save_user_constraint_presets(USER_CONSTRAINT_PRESETS)
+        if not ok_disk:
+            QtWidgets.QMessageBox.warning(self, "Restriciones de Dosis", f"No se pudo guardar en disco:\n{err}")
         self._selected_name = ""
         self._reload_combo()
         self.cmb_preset.setCurrentText("Elegir manualmente")

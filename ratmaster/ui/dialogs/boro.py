@@ -16,7 +16,7 @@ from ratmaster.constants import (
     _is_builtin_boro_protocol, _resolve_boro_protocol_name,
     _sanitize_boro_protocol_dict,
 )
-from ratmaster.app_paths import ensure_user_json
+from ratmaster.data.persistence import save_user_boro_protocols
 
 
 class BoroDialog(QtWidgets.QDialog):
@@ -153,7 +153,12 @@ class BoroDialog(QtWidgets.QDialog):
         if name in PROTO_LIB:
             if QtWidgets.QMessageBox.question(self, "Sobrescribir", f"Ya existe '{name}'. ¿Sobrescribirlo?") != QtWidgets.QMessageBox.Yes:
                 return
-        PROTO_LIB[name] = {"ref": "Usuario", "B_ppm": B.tolist(), "B_err": Be.tolist()}
+        entry = {"ref": "Usuario", "B_ppm": B.tolist(), "B_err": Be.tolist()}
+        PROTO_LIB[name] = entry
+        USER_BORO_PROTOCOLS[name] = entry
+        ok_disk, err = save_user_boro_protocols(USER_BORO_PROTOCOLS)
+        if not ok_disk:
+            QtWidgets.QMessageBox.warning(self, "Protocolo", f"No se pudo guardar en disco:\n{err}")
         self._selected_name = name
         self._reload_combo()
         self.cmb_proto.setCurrentText(name)
@@ -170,6 +175,10 @@ class BoroDialog(QtWidgets.QDialog):
         if QtWidgets.QMessageBox.question(self, "Borrar protocolo", f"¿Borrar el protocolo '{name}'?") != QtWidgets.QMessageBox.Yes:
             return
         PROTO_LIB.pop(name, None)
+        USER_BORO_PROTOCOLS.pop(name, None)
+        ok_disk, err = save_user_boro_protocols(USER_BORO_PROTOCOLS)
+        if not ok_disk:
+            QtWidgets.QMessageBox.warning(self, "Protocolo", f"No se pudo guardar en disco:\n{err}")
         self._selected_name = "(manual)"
         self._reload_combo()
         self.cmb_proto.setCurrentText("Editar manualmente")

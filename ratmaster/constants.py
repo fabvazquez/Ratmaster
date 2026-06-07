@@ -68,8 +68,8 @@ CBE_PRESET = {
     "CBE_value": [1.4, 1.4, 1.4, 1.4, 1.4, 1.4, 3.8, 1.4],
 }
 
-# Dictionaries para protocolos, constraints e IsoE definidos por el usuario en runtime
-# (se cargan desde el JSON de configuración al iniciar la app)
+# Dictionaries para protocolos, constraints e IsoE definidos por el usuario.
+# Se poblan al iniciar la app llamando a load_all_user_data() (ver abajo).
 USER_BORO_PROTOCOLS: dict = {}
 USER_CONSTRAINT_PRESETS: dict = {}
 USER_ISOE_PRESETS: dict = {}
@@ -181,3 +181,61 @@ def _defaults_from_libs(proto_name: str = "BPA46.5") -> dict:
         "RBE":         np.array(RBE_PRESET["RBE_value"], dtype=float).ravel(),
         "Constraints": None,
     }
+
+
+# ── Carga de datos de usuario al iniciar ─────────────────────────────────────
+
+def load_all_user_data() -> None:
+    """
+    Carga desde disco todos los datos persistidos por el usuario y los
+    incorpora en los dicts globales de este módulo (PROTO_LIB,
+    CONSTRAINT_PRESETS, USER_BORO_PROTOCOLS, USER_CONSTRAINT_PRESETS,
+    USER_ISOE_PRESETS).
+
+    Debe llamarse UNA sola vez al arrancar la aplicación, antes de que
+    se cree cualquier ventana o diálogo.
+
+    Los presets builtin nunca se sobreescriben: si hay un nombre de usuario
+    que coincide con un builtin, la entrada de usuario se ignora.
+    """
+    # Importación local para evitar dependencia circular en module-level
+    from ratmaster.data.persistence import (
+        load_user_boro_protocols,
+        load_user_constraint_presets,
+        load_user_isoe_presets,
+    )
+
+    # ── Protocolos de boro ────────────────────────────────────────────────────
+    raw_boro = load_user_boro_protocols()
+    for name, data in raw_boro.items():
+        if _is_builtin_boro_protocol(name):
+            continue
+        try:
+            clean = _sanitize_boro_protocol_dict(name, data)
+            PROTO_LIB[name]           = clean
+            USER_BORO_PROTOCOLS[name] = clean
+        except Exception:
+            pass  # entrada corrupta: se omite silenciosamente
+
+    # ── Constraints ───────────────────────────────────────────────────────────
+    raw_cons = load_user_constraint_presets()
+    for name, mat in raw_cons.items():
+        if _is_builtin_constraint_preset(name):
+            continue
+        CONSTRAINT_PRESETS[name]       = mat
+        USER_CONSTRAINT_PRESETS[name]  = mat
+
+    # ── Presets IsoE ──────────────────────────────────────────────────────────
+    raw_isoe = load_user_isoe_presets()
+    for name, preset in raw_isoe.items():
+        if _is_builtin_isoe_preset(name):
+            continue
+        if not isinstance(preset, dict):
+            continue
+        # Incorporar en el dict global de physics/isoe (si ya fue importado)
+        try:
+            from ratmaster.physics.isoe import ISOE_PARAM_PRESETS
+            ISOE_PARAM_PRESETS[name] = preset
+        except Exception:
+            pass
+        USER_ISOE_PRESETS[name] = preset
