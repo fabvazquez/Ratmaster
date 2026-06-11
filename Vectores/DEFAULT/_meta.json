@@ -1,19 +1,26 @@
 {
-  "created_at": "2026-02-25T14:19:57",
-  "vector_set": "DEFAULT",
-  "seg_path": "C:\\Users\\fabio\\Desktop\\union seg mesh\\seg_256_piel.seg",
-  "meshtal_path": "C:\\Users\\fabio\\Desktop\\union seg mesh\\rat_spnd.msh",
-  "voxel_size_mm": [
+  "created_at": "2026-06-05T23:50:24",
+  "vector_set": "vectores_ok",
+  "seg_path": "C:\\Users\\fabio\\Downloads\\resultados rata-20260425T184112Z-3-002\\resultados rata\\seg_256_piel.seg",
+  "seg_filename": "seg_256_piel.seg",
+  "meshtal_path": "C:\\Users\\fabio\\Downloads\\resultados rata-20260425T184112Z-3-002\\resultados rata\\rat_con_tapa_cont_15_5.msht",
+  "meshtal_filename": "rat_con_tapa_cont_15_5.msht",
+  "voxel_size_mm_input": [
+    0.78125,
+    0.3325,
+    0.3325
+  ],
+  "voxel_size_mm_after_transforms": [
     0.78125,
     0.3325,
     0.3325
   ],
   "origin_mesh_cm": [
-    230.0,
-    -2.25,
-    -5.0
+    229.59,
+    -2.006,
+    -4.19
   ],
-  "factor_spnd": 3.6006e-09,
+  "factor_spnd": 3.28951e-09,
   "tallies": [
     14,
     24,
@@ -21,5 +28,16 @@
     44
   ],
   "tally_overlay": 14,
-  "fix_geom": true
+  "geom_transforms_enabled": true,
+  "geom_transforms": [
+    {
+      "op": "swap_YZ"
+    },
+    {
+      "op": "flip_X"
+    },
+    {
+      "op": "flip_Z"
+    }
+  ]
 }
