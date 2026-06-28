@@ -46,18 +46,20 @@ PROTO_LIB = {
         # Concentración de boro tisular [ppm] por órgano
         "B_ppm": [12.2, 5.5,  5.5,  18.7, 69.0, 14.9, 22.9, 18.5],
         # Incertidumbre en B_ppm [ppm]
-        "B_err": [ 7.2, 0.0,  2.4,   0.0, 32.0,  3.7,  7.2,  7.9],
+        "B_err": [ 7.2, 2.4,  2.4,   0.0, 32.0,  3.7,  7.2,  7.9],
     },
     "B_GB10_50IV": {
         "ref": "TODO: agregar referencia bibliográfica",
-        "B_ppm": [10.3, 26.8, 1.6,  0.0, 27.3, 7.2, 12.8, 16.1],
-        "B_err": [ 2.4, 14.2, 0.8,  0.0,  7.3, 5.4,  4.1,  8.7],
+        "B_ppm": [10.3, 1.6, 1.6,  0.0, 27.3, 7.2, 12.8, 16.1],
+        "B_err": [ 2.4, 0.8, 0.8,  0.0,  7.3, 5.4,  4.1,  8.7],
     },
 }
 
 # Valores de RBE por órgano (mismo orden que ORG_ORDER)
 RBE_PRESET = {
     "ref": "TODO: agregar referencia bibliográfica",
+    #["Pulmon", "Cerebro", "Medula", "Esofago", "Rinon", "Corazon", "Tumor", "Piel"]
+    #"RBE_value": [2.02, 2.9, 2.9, 3.2, 3.2, 3.2, 1.03, 3.14],
     "RBE_value": [3.2, 3.2, 3.2, 3.2, 3.2, 3.2, 3.2, 3.2],
 }
 
@@ -65,6 +67,7 @@ RBE_PRESET = {
 # Nota: el Tumor tiene CBE mayor (3.8) que los tejidos normales (1.4)
 CBE_PRESET = {
     "ref": "TODO: agregar referencia bibliográfica",
+    #"CBE_value": [2.31, 2.2 ,  2.2 , 1.4, 1.4, 1.4, 3.35, 3.76],
     "CBE_value": [1.4, 1.4, 1.4, 1.4, 1.4, 1.4, 3.8, 1.4],
 }
 

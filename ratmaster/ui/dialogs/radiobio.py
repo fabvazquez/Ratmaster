@@ -1,67 +1,898 @@
 """
-ui/dialogs/radiobio.py  —  Análisis radiobiológico TCP / NTCP / BED / EQD2
+ui/dialogs/radiobio.py
+======================
+Diálogo de análisis radiobiológico para RatMaster.
+
+Se abre desde ResultsDialog → botón "Prob. Dosis-Efecto".
+Requiere modo IsoE activo y parámetros isoe_params_by_organ.
+
+Pestañas:
+  1. TCP Tumor (HK)      — modelo Hug-Kellerer + Martel (Rubén 2024)
+  2. NTCP Piel           — modelo sub-volumen González et al. (2009)
+  3. TCP/NTCP clásico    — Poisson + LKB (módulo radiobio existente)
+
+Layout por pestaña:
+  QSplitter vertical
+  ├── Panel superior (QScrollArea) — selección, parámetros, botón, resultados
+  └── Panel inferior (fijo)        — canvas matplotlib con altura garantizada
 """
+
 from __future__ import annotations
 import numpy as np
-from scipy.optimize import brentq
-from scipy.special import ndtr
-from PySide6 import QtCore, QtWidgets
-from ratmaster.ui.canvas import MplCanvas
-from ratmaster.physics.radiobio.models import (
-    compute_radiobio_report, RadiobioOrganParams, TISSUE_DEFAULTS,
-)
-from ratmaster.physics.radiobio.tcp  import tcp_dose_curve
-from ratmaster.physics.radiobio.ntcp import ntcp_dose_curve
-from ratmaster.physics.radiobio.eud  import geud
+from PySide6 import QtCore, QtWidgets, QtGui
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure as MplFigure
 
-_COLORS = ["#E53935","#1E88E5","#43A047","#8E24AA",
-           "#FB8C00","#00ACC1","#6D4C41","#F06292","#AED581","#546E7A"]
+from ratmaster.physics.radiobio.tcp_hk import (
+    tcp_hk_stats, tcp_hk_dose_curve, mc_tcp_hk_uncertainty,
+    MARTEL_PARAMS, DEFAULT_K1, DEFAULT_K2, DEFAULT_K3,
+    DEFAULT_D50, DEFAULT_GAMMA, HK_K1_CI, HK_K2_CI, HK_K3_CI,
+)
+from ratmaster.physics.radiobio.ntcp_skin import (
+    skin_dose_stats, ntcp_skin_dose_curve, mc_ntcp_skin_uncertainty,
+    ntcp_skin_single_dose_field, ntcp_skin_field_geometry,
+    DEFAULT_N0_SKIN, DEFAULT_K_SKIN, DEFAULT_ALPHA_SKIN, DEFAULT_TOP_FRACTION,
+    DEFAULT_A_REF_CM2,
+)
+from ratmaster.physics.radiobio.tcp  import tcp_stats
+from ratmaster.physics.radiobio.ntcp import ntcp_stats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constantes de estilo
+# ─────────────────────────────────────────────────────────────────────────────
+
+_HDR_COLOR = "#455A64"
+_HDR_TEXT  = "#FFFFFF"
+_ROW_EVEN  = "#F5F7FA"
+_BORDER    = "#CFD8DC"
+
+_TBL_STYLE = (
+    f"QHeaderView::section {{ background:{_HDR_COLOR}; color:{_HDR_TEXT}; "
+    f"font-weight:600; padding:4px; border:none; "
+    f"border-right:1px solid #546E7A; }}"
+    f"QTableWidget {{ alternate-background-color:{_ROW_EVEN}; "
+    f"gridline-color:{_BORDER}; }}"
+)
+
+_CHART_MIN_H = 280   # altura mínima del panel del gráfico
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _cell(txt, align=QtCore.Qt.AlignCenter):
-    item = QtWidgets.QTableWidgetItem(str(txt))
-    item.setFlags(QtCore.Qt.ItemIsEnabled)
-    item.setTextAlignment(int(align))
-    return item
+def _dbl(val: float, dec: int = 4) -> QtWidgets.QDoubleSpinBox:
+    sb = QtWidgets.QDoubleSpinBox()
+    sb.setDecimals(dec)
+    sb.setRange(0.0, 1e6)
+    sb.setValue(val)
+    return sb
 
 
-def _info(html: str) -> QtWidgets.QLabel:
-    lbl = QtWidgets.QLabel(html)
+def _sel_label(text: str, big: bool = False) -> QtWidgets.QLabel:
+    """Label con texto seleccionable (para copiar resultados)."""
+    lbl = QtWidgets.QLabel(text)
+    lbl.setTextInteractionFlags(
+        QtCore.Qt.TextSelectableByMouse | QtCore.Qt.TextSelectableByKeyboard
+    )
+    lbl.setCursor(QtGui.QCursor(QtCore.Qt.IBeamCursor))
     lbl.setWordWrap(True)
-    lbl.setStyleSheet("background:#eef2ff; padding:6px; border-radius:4px; "
-                      "font-size:12px;")
+    if big:
+        lbl.setStyleSheet("font-size: 13pt; font-weight: bold;")
     return lbl
 
 
-def _find_scale_at(A_arr: np.ndarray, aR, bR, GR, N0, target: float,
-                   hi=30.0) -> float | None:
-    """Escala de dosis donde TCP = target (fracción). None si no existe en [0, hi]."""
-    def obj(s):
-        S = np.exp(-aR * A_arr * s - GR * bR * (A_arr * s)**2)
-        return float(np.exp(-N0 * float(np.mean(S)))) - target
-    try:
-        if obj(1e-6) * obj(hi) > 0:
-            return None
-        return float(brentq(obj, 1e-6, hi, xtol=1e-3))
-    except Exception:
-        return None
+def _make_table(headers: list[str], rows: list[list]) -> QtWidgets.QTableWidget:
+    tbl = QtWidgets.QTableWidget(len(rows), len(headers))
+    tbl.setHorizontalHeaderLabels(headers)
+    tbl.verticalHeader().setVisible(False)
+    tbl.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+    tbl.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+    tbl.setAlternatingRowColors(True)
+    tbl.setStyleSheet(_TBL_STYLE)
+    tbl.setSizePolicy(
+        QtWidgets.QSizePolicy.Expanding,
+        QtWidgets.QSizePolicy.Preferred,
+    )
+    for r, row in enumerate(rows):
+        for c, val in enumerate(row):
+            it = QtWidgets.QTableWidgetItem(str(val))
+            it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+            align = (
+                QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter
+            ) if c == 0 else (
+                QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter
+            )
+            it.setTextAlignment(align)
+            tbl.setItem(r, c, it)
+    tbl.resizeColumnsToContents()
+    tbl.horizontalHeader().setStretchLastSection(True)
+    # Altura exacta para no necesitar scroll interno
+    h = tbl.horizontalHeader().height() + 4
+    for i in range(tbl.rowCount()):
+        h += tbl.rowHeight(i)
+    tbl.setFixedHeight(h + 4)
+    return tbl
 
 
-def _find_ntcp_scale(A_arr, TD50, m, n, model, target, hi=30.0) -> float | None:
-    from ratmaster.physics.radiobio.ntcp import ntcp_lkb, ntcp_logistic
-    fn = ntcp_lkb if model == "lkb" else ntcp_logistic
-    def obj(s):
-        return fn(A_arr * s, TD50, m, n) - target
-    try:
-        if obj(1e-6) * obj(hi) > 0:
-            return None
-        return float(brentq(obj, 1e-6, hi, xtol=1e-3))
-    except Exception:
-        return None
+def _chart_panel(fig: MplFigure, canvas: FigureCanvasQTAgg) -> QtWidgets.QWidget:
+    """Widget contenedor para el gráfico con altura mínima garantizada."""
+    panel = QtWidgets.QWidget()
+    panel.setMinimumHeight(_CHART_MIN_H)
+    panel.setSizePolicy(
+        QtWidgets.QSizePolicy.Expanding,
+        QtWidgets.QSizePolicy.Expanding,
+    )
+    lay = QtWidgets.QVBoxLayout(panel)
+    lay.setContentsMargins(4, 4, 4, 4)
+    canvas.setSizePolicy(
+        QtWidgets.QSizePolicy.Expanding,
+        QtWidgets.QSizePolicy.Expanding,
+    )
+    lay.addWidget(canvas)
+    return panel
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pestaña 1: TCP Tumor — Hug-Kellerer + Martel
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _TcpHkTab(QtWidgets.QWidget):
+    """
+    Layout: QSplitter vertical
+      ▲ ScrollArea  — selección de órgano, parámetros, botón, resultados
+      ▼ Panel fijo  — gráfico matplotlib (altura mínima _CHART_MIN_H px)
+    """
+
+    def __init__(self, parent, iso_vox: dict, sigma_vox: dict):
+        super().__init__(parent)
+        self.iso_vox   = iso_vox
+        self.sigma_vox = sigma_vox
+
+        # ── Canvas (se crea antes para poder pasarlo al panel) ────────
+        self.fig  = MplFigure(tight_layout=True)
+        self.canv = FigureCanvasQTAgg(self.fig)
+        self._draw_empty()
+
+        # ── Splitter principal ────────────────────────────────────────
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        splitter.setChildrenCollapsible(False)
+
+        # Panel superior: scroll con controles y resultados
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        top_widget = self._build_top_panel()
+        scroll.setWidget(top_widget)
+        splitter.addWidget(scroll)
+
+        # Panel inferior: gráfico
+        splitter.addWidget(_chart_panel(self.fig, self.canv))
+
+        # Proporciones iniciales: 45% arriba, 55% abajo
+        splitter.setSizes([400, 350])
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(splitter)
+
+    # ── Construcción del panel superior ──────────────────────────────
+
+    def _build_top_panel(self) -> QtWidgets.QWidget:
+        w   = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(w)
+        lay.setSpacing(8)
+        lay.setContentsMargins(8, 8, 8, 4)
+
+        # Selección de órgano
+        row_org = QtWidgets.QHBoxLayout()
+        row_org.addWidget(QtWidgets.QLabel("<b>Órgano tumoral:</b>"))
+        self.organ_cb = QtWidgets.QComboBox()
+        organs = sorted(self.iso_vox.keys())
+        self.organ_cb.addItems(organs)
+        for i, o in enumerate(organs):
+            if "tumor" in o.lower():
+                self.organ_cb.setCurrentIndex(i)
+                break
+        row_org.addWidget(self.organ_cb)
+        row_org.addStretch()
+        lay.addLayout(row_org)
+
+        # GroupBox parámetros
+        gb = QtWidgets.QGroupBox("Parámetros del modelo")
+        form = QtWidgets.QFormLayout(gb)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(6)
+
+        # Seguimiento Martel
+        self.followup_cb = QtWidgets.QComboBox()
+        for m, (d50, g, _) in MARTEL_PARAMS.items():
+            self.followup_cb.addItem(
+                f"{m} meses  (D50={d50} Gy, γ={g})", userData=(d50, g)
+            )
+        self.followup_cb.setCurrentIndex(1)
+        form.addRow("Seguimiento Martel:", self.followup_cb)
+
+        # k1, k2, k3
+        hk_row = QtWidgets.QHBoxLayout()
+        self.sb_k1 = _dbl(DEFAULT_K1, 4); self.sb_k1.setRange(0.01, 100.0)
+        self.sb_k2 = _dbl(DEFAULT_K2, 4); self.sb_k2.setRange(0.01, 200.0)
+        self.sb_k3 = _dbl(DEFAULT_K3, 4); self.sb_k3.setRange(0.001, 10.0)
+        for lbl, sb in (("k₁:", self.sb_k1), ("k₂:", self.sb_k2), ("k₃:", self.sb_k3)):
+            hk_row.addWidget(QtWidgets.QLabel(lbl))
+            hk_row.addWidget(sb)
+        hk_row.addWidget(QtWidgets.QLabel("[Gy⁻¹]"))
+        hk_row.addStretch()
+        form.addRow("HK (H460):", hk_row)
+
+        ic_lbl = QtWidgets.QLabel(
+            f"IC 95%: k₁ [{HK_K1_CI[0]}, {HK_K1_CI[1]}]  "
+            f"k₂ [{HK_K2_CI[0]}, {HK_K2_CI[1]}]  "
+            f"k₃ [{HK_K3_CI[0]}, {HK_K3_CI[1]}]"
+        )
+        ic_lbl.setStyleSheet("color:#607D8B; font-size:9pt;")
+        form.addRow("", ic_lbl)
+
+        # D50, γ
+        martel_row = QtWidgets.QHBoxLayout()
+        self.sb_d50   = _dbl(DEFAULT_D50,   2); self.sb_d50.setRange(1.0, 300.0)
+        self.sb_gamma = _dbl(DEFAULT_GAMMA,  3); self.sb_gamma.setRange(0.1, 20.0)
+        martel_row.addWidget(QtWidgets.QLabel("D50:"))
+        martel_row.addWidget(self.sb_d50)
+        martel_row.addWidget(QtWidgets.QLabel("Gy   γ:"))
+        martel_row.addWidget(self.sb_gamma)
+        martel_row.addStretch()
+        form.addRow("Martel (NSCLC):", martel_row)
+
+        # Muestras MC
+        self.sb_mc = QtWidgets.QSpinBox()
+        self.sb_mc.setRange(100, 5000); self.sb_mc.setValue(500)
+        self.sb_mc.setSingleStep(100)
+        form.addRow("Muestras MC:", self.sb_mc)
+
+        lay.addWidget(gb)
+
+        # Botón
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_calc = QtWidgets.QPushButton("Calcular TCP (HK)")
+        self.btn_calc.setStyleSheet(
+            "QPushButton{background:#1565C0;color:white;font-weight:600;"
+            "padding:6px 20px;border-radius:4px;}"
+            "QPushButton:hover{background:#1976D2;}"
+        )
+        btn_row.addWidget(self.btn_calc)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        # Resultados
+        res_gb  = QtWidgets.QGroupBox("Resultado")
+        res_lay = QtWidgets.QVBoxLayout(res_gb)
+        res_lay.setSpacing(3)
+
+        self.lbl_tcp  = _sel_label("TCP (HK): —", big=True)
+        self.lbl_tcp.setStyleSheet(
+            "font-size:14pt; font-weight:bold; color:#1565C0;"
+        )
+        self.lbl_mc   = _sel_label("IC 90% MC: —")
+        self.lbl_deq  = _sel_label("EQD2 media (2 Gy/fx): —")
+        self.lbl_diso = _sel_label("Dosis IsoE media: —")
+        self.lbl_nvox = _sel_label("Vóxeles: —")
+        self.lbl_nvox.setStyleSheet("color:#607D8B; font-size:9pt;")
+
+        for lbl in (self.lbl_tcp, self.lbl_mc, self.lbl_deq,
+                    self.lbl_diso, self.lbl_nvox):
+            res_lay.addWidget(lbl)
+
+        lay.addWidget(res_gb)
+        lay.addStretch()
+
+        # Señales
+        self.followup_cb.currentIndexChanged.connect(self._on_followup)
+        self.btn_calc.clicked.connect(self._calc)
+
+        return w
+
+    # ── Slots ─────────────────────────────────────────────────────────
+
+    def _on_followup(self, _):
+        d50, g = self.followup_cb.currentData()
+        self.sb_d50.setValue(d50)
+        self.sb_gamma.setValue(g)
+
+    def _calc(self):
+        organ  = self.organ_cb.currentText()
+        A      = np.asarray(self.iso_vox.get(organ, []), float)
+        if A.size == 0:
+            QtWidgets.QMessageBox.warning(
+                self, "Sin datos",
+                f"No hay datos de dosis isoefectiva para '{organ}'."
+            )
+            return
+
+        sA = np.asarray(self.sigma_vox.get(organ, [0.0] * A.size), float)
+        if sA.size != A.size:
+            sA = np.zeros_like(A)
+
+        k1, k2, k3 = self.sb_k1.value(), self.sb_k2.value(), self.sb_k3.value()
+        D50  = self.sb_d50.value()
+        gam  = self.sb_gamma.value()
+        N_mc = self.sb_mc.value()
+
+        st = tcp_hk_stats(A, k1, k2, k3, D50, gam)
+        mc = mc_tcp_hk_uncertainty(A, sA, k1, k2, k3, D50, gam, N_samples=N_mc)
+
+        v = st["TCP_HK"]
+        self.lbl_tcp.setText(f"TCP (HK): {v:.4f}  ({v*100:.1f}%)")
+        self.lbl_mc.setText(
+            f"IC 90% MC: [{mc['TCP_p5']:.4f}, {mc['TCP_p95']:.4f}]"
+            f"   σ = {mc['TCP_std']:.4f}"
+        )
+        self.lbl_deq.setText(
+            f"EQD2 media (2 Gy/fx): {st['D_eq_mean']:.2f} Gy"
+        )
+        self.lbl_diso.setText(
+            f"Dosis IsoE media: {st['D_iso_mean']:.2f} Gy_eq"
+        )
+        self.lbl_nvox.setText(f"Vóxeles: {st['N_voxels']:,}")
+
+        self._plot(A, st, k1, k2, k3, D50, gam, organ)
+
+    def _draw_empty(self):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        ax.set_xlabel("Dosis IsoE BNCT [Gy_eq]", fontsize=9)
+        ax.set_ylabel("TCP (%)", fontsize=9)
+        ax.set_title("Curva dosis-respuesta TCP (HK + Martel)", fontsize=9)
+        ax.set_xlim(0, 100); ax.set_ylim(0, 105)
+        ax.grid(True, color="#E0E0E0", lw=0.7)
+        ax.text(0.5, 0.5, "Presioná «Calcular TCP» para ver la curva",
+                ha="center", va="center", transform=ax.transAxes,
+                color="#90A4AE", fontsize=10)
+        self.canv.draw()
+
+    def _plot(self, A, st, k1, k2, k3, D50, gam, organ):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+
+        d_max   = max(float(np.max(A)) * 1.6, 50.0)
+        d_curve = np.linspace(0.0, d_max, 400)
+        tcp_c   = tcp_hk_dose_curve(d_curve, k1, k2, k3, D50, gam)
+
+        ax.plot(d_curve, tcp_c * 100, color="#1565C0", lw=2,
+                label=f"TCP HK  (D50={D50:.0f} Gy, γ={gam:.1f})")
+
+        v      = st["TCP_HK"]
+        d_mean = st["D_iso_mean"]
+        ax.plot(d_mean, v * 100, "o", color="#E53935", ms=9, zorder=5,
+                label=f"Plan: D_mean={d_mean:.1f} Gy_eq  →  TCP={v*100:.1f}%")
+
+        ax.axhline(50, color="#757575", ls="--", lw=0.8, alpha=0.6, label="50%")
+        ax.axhline(80, color="#43A047", ls="--", lw=0.8, alpha=0.6, label="80%")
+        ax.axvline(D50, color="#FF8F00", ls=":", lw=0.9, alpha=0.7,
+                   label=f"D50 = {D50:.0f} Gy")
+
+        ax.set_xlabel("Dosis IsoE BNCT (fracción única) [Gy_eq]", fontsize=9)
+        ax.set_ylabel("TCP (%)", fontsize=9)
+        ax.set_title(f"TCP — HK + Martel — {organ}", fontsize=9)
+        ax.set_xlim(0, d_max); ax.set_ylim(0, 105)
+        ax.grid(True, color="#E0E0E0", lw=0.7)
+        ax.legend(fontsize=8, framealpha=0.88, loc="lower right")
+        self.fig.tight_layout(pad=1.2)
+        self.canv.draw()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pestaña 2: NTCP Piel — González et al. 2009
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _NtcpSkinTab(QtWidgets.QWidget):
+    """
+    Layout: QSplitter vertical
+      ▲ ScrollArea  — selección, parámetros, botón, resultados + tabla FOM
+      ▼ Panel fijo  — gráfico matplotlib
+    """
+
+    _SKIN_KW = ("piel", "skin", "derm")
+
+    def __init__(self, parent, iso_vox: dict, sigma_vox: dict):
+        super().__init__(parent)
+        self.iso_vox   = iso_vox
+        self.sigma_vox = sigma_vox
+        self._last_fom_tbl: QtWidgets.QTableWidget | None = None
+
+        self.fig  = MplFigure(tight_layout=True)
+        self.canv = FigureCanvasQTAgg(self.fig)
+        self._draw_empty()
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        splitter.setChildrenCollapsible(False)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(self._build_top_panel())
+        splitter.addWidget(scroll)
+
+        splitter.addWidget(_chart_panel(self.fig, self.canv))
+        splitter.setSizes([420, 330])
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(splitter)
+
+    def _build_top_panel(self) -> QtWidgets.QWidget:
+        w   = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(w)
+        lay.setSpacing(8)
+        lay.setContentsMargins(8, 8, 8, 4)
+
+        # Selección de órgano
+        row_org = QtWidgets.QHBoxLayout()
+        row_org.addWidget(QtWidgets.QLabel("<b>Órgano piel:</b>"))
+        self.organ_cb = QtWidgets.QComboBox()
+        organs = sorted(self.iso_vox.keys())
+        self.organ_cb.addItems(organs)
+        for i, o in enumerate(organs):
+            if any(k in o.lower() for k in self._SKIN_KW):
+                self.organ_cb.setCurrentIndex(i)
+                break
+        row_org.addWidget(self.organ_cb)
+        row_org.addStretch()
+        lay.addLayout(row_org)
+
+        # Parámetros
+        gb   = QtWidgets.QGroupBox("Parámetros  [González et al. 2009, Ec. 2.1]")
+        form = QtWidgets.QFormLayout(gb)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(6)
+
+        self.sb_N0    = _dbl(DEFAULT_N0_SKIN,    3); self.sb_N0.setRange(0.001, 100.0)
+        self.sb_k     = _dbl(DEFAULT_K_SKIN,     3); self.sb_k.setRange(0.01, 5.0)
+        self.sb_alpha = _dbl(DEFAULT_ALPHA_SKIN,  4); self.sb_alpha.setRange(0.001, 5.0)
+        form.addRow("N₀:", self.sb_N0)
+        form.addRow("k:",  self.sb_k)
+        form.addRow("α [Gy⁻¹]:", self.sb_alpha)
+
+        note = QtWidgets.QLabel(
+            "Ajustados a tolerancia de piel, fracción única "
+            "(Ellis 1968, Hopewell 1990)."
+        )
+        note.setStyleSheet("color:#607D8B; font-size:9pt;")
+        note.setWordWrap(True)
+        form.addRow("", note)
+
+        self.sb_topf = _dbl(DEFAULT_TOP_FRACTION * 100, 1)
+        self.sb_topf.setRange(1.0, 100.0)
+        self.sb_topf.setSuffix("%")
+        self.sb_topf.setToolTip(
+            "Fracción de vóxeles de mayor dosis para D_top_mean y PEUD\n"
+            "(proxy de 100 cm² del paper)."
+        )
+        form.addRow("Top % vóxeles (≈ 100 cm²):", self.sb_topf)
+
+        self.sb_mc = QtWidgets.QSpinBox()
+        self.sb_mc.setRange(100, 5000); self.sb_mc.setValue(500)
+        self.sb_mc.setSingleStep(100)
+        form.addRow("Muestras MC:", self.sb_mc)
+
+        lay.addWidget(gb)
+
+        # ── Grupo: NTCP por geometría de campo real ───────────────────
+        # N0,k,α fueron calibrados con ν = fracción de un área de
+        # referencia clínica (100 cm²). La fracción de vóxeles/volumen
+        # de la piel SEGMENTADA del rat (panel de arriba) NO es esa
+        # misma escala — para un campo de irradiación geométrico (p.ej.
+        # el corte cilíndrico parcial calculado por geometría), usar
+        # este panel en su lugar.
+        gb_field = QtWidgets.QGroupBox(
+            "NTCP por geometría de campo real  [recomendado p/ campo parcial]"
+        )
+        form_f = QtWidgets.QFormLayout(gb_field)
+        form_f.setHorizontalSpacing(12)
+        form_f.setVerticalSpacing(6)
+
+        note_f = QtWidgets.QLabel(
+            "Usar cuando el campo irradiado es una región geométrica "
+            "(ej. media superficie cilíndrica) y NO toda la piel "
+            "segmentada del rat. ν se calcula como fracción del área "
+            "de referencia (100 cm², González 2009), no como fracción "
+            "del volumen de piel segmentado."
+        )
+        note_f.setWordWrap(True)
+        note_f.setStyleSheet("color:#607D8B; font-size:9pt;")
+        form_f.addRow(note_f)
+
+        self.sb_Dfield = _dbl(28.5, 2)
+        self.sb_Dfield.setRange(0.0, 200.0)
+        self.sb_Dfield.setToolTip(
+            "Dosis isoefectiva representativa del campo [Gy_eq]\n"
+            "(ej. D_max, o el valor escalado por Cohen-Kerrich)."
+        )
+        form_f.addRow("D_campo [Gy_eq]:", self.sb_Dfield)
+
+        self.sb_Afield = _dbl(20.9, 2)
+        self.sb_Afield.setRange(0.001, 10000.0)
+        self.sb_Afield.setToolTip(
+            "Área geométrica real del campo irradiado [cm²]\n"
+            "(ej. A = π·r·L para el corte cilíndrico parcial)."
+        )
+        form_f.addRow("A_campo [cm²]:", self.sb_Afield)
+
+        self.sb_Aref = _dbl(DEFAULT_A_REF_CM2, 1)
+        self.sb_Aref.setRange(1.0, 10000.0)
+        self.sb_Aref.setToolTip(
+            "Área de referencia de calibración del modelo\n"
+            "(100 cm² en González et al. 2009 — no cambiar salvo\n"
+            "recalibración de N0, k, α)."
+        )
+        form_f.addRow("A_ref [cm²]:", self.sb_Aref)
+
+        self.btn_calc_field = QtWidgets.QPushButton("Calcular NTCP de campo")
+        self.btn_calc_field.setStyleSheet(
+            "QPushButton{background:#4527A0;color:white;font-weight:600;"
+            "padding:6px 20px;border-radius:4px;}"
+            "QPushButton:hover{background:#512DA8;}"
+        )
+        form_f.addRow(self.btn_calc_field)
+
+        self.lbl_ntcp_field = _sel_label("NTCP (campo): —", big=True)
+        self.lbl_ntcp_field.setStyleSheet(
+            "font-size:13pt; font-weight:bold; color:#4527A0;"
+        )
+        self.lbl_nu_field = _sel_label("ν_campo = A_campo / A_ref: —")
+        form_f.addRow(self.lbl_ntcp_field)
+        form_f.addRow(self.lbl_nu_field)
+
+        lay.addWidget(gb_field)
+        self.btn_calc_field.clicked.connect(self._calc_field)
+        # ────────────────────────────────────────────────────────────
+
+        # Botón
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_calc = QtWidgets.QPushButton("Calcular NTCP Piel")
+        self.btn_calc.setStyleSheet(
+            "QPushButton{background:#6A1B9A;color:white;font-weight:600;"
+            "padding:6px 20px;border-radius:4px;}"
+            "QPushButton:hover{background:#7B1FA2;}"
+        )
+        btn_row.addWidget(self.btn_calc)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        # Resultados numéricos
+        res_gb  = QtWidgets.QGroupBox("Resultado")
+        res_lay = QtWidgets.QVBoxLayout(res_gb)
+        res_lay.setSpacing(3)
+
+        self.lbl_ntcp  = _sel_label("NTCP (piel): —", big=True)
+        self.lbl_ntcp.setStyleSheet(
+            "font-size:14pt; font-weight:bold; color:#6A1B9A;"
+        )
+        self.lbl_mc   = _sel_label("IC 90% MC: —")
+        self.lbl_dmax = _sel_label("D_max: —")
+        self.lbl_dtop = _sel_label("D_top_mean: —")
+        self.lbl_peud = _sel_label("PEUD_top: —")
+        self.lbl_frac = _sel_label("Fracción ≥15/18/20 Gy-Eq: —")
+        self.lbl_nvox = _sel_label("Vóxeles: —")
+        self.lbl_nvox.setStyleSheet("color:#607D8B; font-size:9pt;")
+
+        for lbl in (self.lbl_ntcp, self.lbl_mc, self.lbl_dmax,
+                    self.lbl_dtop, self.lbl_peud, self.lbl_frac, self.lbl_nvox):
+            res_lay.addWidget(lbl)
+
+        # Tabla FOM (se inserta dinámicamente después del cálculo)
+        self._fom_container = QtWidgets.QWidget()
+        self._fom_lay       = QtWidgets.QVBoxLayout(self._fom_container)
+        self._fom_lay.setContentsMargins(0, 4, 0, 0)
+        res_lay.addWidget(self._fom_container)
+
+        lay.addWidget(res_gb)
+        lay.addStretch()
+
+        self.btn_calc.clicked.connect(self._calc)
+        return w
+
+    def _calc(self):
+        organ = self.organ_cb.currentText()
+        A     = np.asarray(self.iso_vox.get(organ, []), float)
+        if A.size == 0:
+            QtWidgets.QMessageBox.warning(
+                self, "Sin datos",
+                f"No hay datos de dosis isoefectiva para '{organ}'."
+            )
+            return
+
+        sA = np.asarray(self.sigma_vox.get(organ, [0.0] * A.size), float)
+        if sA.size != A.size:
+            sA = np.zeros_like(A)
+
+        N0    = self.sb_N0.value()
+        k     = self.sb_k.value()
+        alpha = self.sb_alpha.value()
+        tf    = self.sb_topf.value() / 100.0
+        N_mc  = self.sb_mc.value()
+
+        st = skin_dose_stats(A, tf, N0, k, alpha)
+        mc = mc_ntcp_skin_uncertainty(A, sA, N0, k, alpha, N_samples=N_mc)
+
+        v = st["NTCP_skin"]
+        self.lbl_ntcp.setText(f"NTCP (piel): {v:.4f}  ({v*100:.1f}%)")
+        self.lbl_mc.setText(
+            f"IC 90% MC: [{mc['NTCP_p5']:.4f}, {mc['NTCP_p95']:.4f}]"
+            f"   σ = {mc['NTCP_std']:.4f}"
+        )
+        self.lbl_dmax.setText(f"D_max: {st['D_max_Gy']:.2f} Gy-Eq")
+        self.lbl_dtop.setText(
+            f"D_top_mean ({tf*100:.0f}% vóx): {st['D_top_mean_Gy']:.2f} Gy-Eq"
+            "  ← proxy D100_mean"
+        )
+        self.lbl_peud.setText(
+            f"PEUD_top ({tf*100:.0f}% vóx): {st['PEUD_top_Gy']:.2f} Gy-Eq"
+            "  ← proxy PEUD100"
+        )
+        self.lbl_frac.setText(
+            f"≥15 Gy: {st['frac_above_15']*100:.1f}%  |  "
+            f"≥18 Gy: {st['frac_above_18']*100:.1f}%  |  "
+            f"≥20 Gy: {st['frac_above_20']*100:.1f}%"
+        )
+        self.lbl_nvox.setText(f"Vóxeles: {st['N_voxels']:,}")
+
+        # Actualizar tabla FOM
+        if self._last_fom_tbl is not None:
+            self._last_fom_tbl.setParent(None)
+            self._last_fom_tbl.deleteLater()
+
+        fom_rows = [
+            ["D_max",           f"{st['D_max_Gy']:.3f}",      "Gy-Eq", "Dosis puntual máxima"],
+            ["D_top_mean",      f"{st['D_top_mean_Gy']:.3f}",  "Gy-Eq", f"Media top {tf*100:.0f}% (≈ D100_mean)"],
+            ["PEUD_top",        f"{st['PEUD_top_Gy']:.3f}",    "Gy-Eq", f"PEUD top {tf*100:.0f}% (≈ PEUD100)"],
+            ["NTCP_skin",       f"{v:.4f}",                    "",       "Probabilidad de complicación"],
+            ["Frac. ≥ 15 Gy",  f"{st['frac_above_15']*100:.1f}%", "",  ""],
+            ["Frac. ≥ 18 Gy",  f"{st['frac_above_18']*100:.1f}%", "",  "Umbral eritema/úlcera"],
+            ["Frac. ≥ 20 Gy",  f"{st['frac_above_20']*100:.1f}%", "",  ""],
+        ]
+        tbl = _make_table(
+            ["Figura de mérito", "Valor", "Unidad", "Nota"], fom_rows
+        )
+        self._last_fom_tbl = tbl
+        self._fom_lay.addWidget(tbl)
+
+        self._plot(A, st, N0, k, alpha, organ)
+
+    def _calc_field(self):
+        D_field = self.sb_Dfield.value()
+        A_field = self.sb_Afield.value()
+        A_ref   = self.sb_Aref.value()
+        N0      = self.sb_N0.value()
+        k       = self.sb_k.value()
+        alpha   = self.sb_alpha.value()
+
+        r = ntcp_skin_single_dose_field(D_field, A_field, A_ref, N0, k, alpha)
+        v = r["NTCP_field"]
+        self.lbl_ntcp_field.setText(
+            f"NTCP (campo): {v:.4f}  ({v*100:.1f}%)"
+        )
+        self.lbl_nu_field.setText(
+            f"ν_campo = A_campo / A_ref = {A_field:.2f} / {A_ref:.1f} "
+            f"= {r['nu_field']:.4f}"
+        )
+
+    def _draw_empty(self):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        ax.set_xlabel("Dosis IsoE BNCT [Gy-Eq]", fontsize=9)
+        ax.set_ylabel("NTCP piel (%)", fontsize=9)
+        ax.set_title("Curva NTCP piel (González et al. 2009)", fontsize=9)
+        ax.set_xlim(0, 40); ax.set_ylim(0, 105)
+        ax.grid(True, color="#E0E0E0", lw=0.7)
+        ax.text(0.5, 0.5, "Presioná «Calcular NTCP Piel» para ver la curva",
+                ha="center", va="center", transform=ax.transAxes,
+                color="#90A4AE", fontsize=10)
+        self.canv.draw()
+
+    def _plot(self, A, st, N0, k, alpha, organ):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+
+        d_max_ax = max(float(np.max(A)) * 1.6, 35.0)
+        d_curve  = np.linspace(0.0, d_max_ax, 300)
+        # Curva de referencia: NTCP si TODA la piel estuviera a esa dosis
+        # uniformemente (ν=1). Ya NO depende de N_vox.
+        ntcp_c   = ntcp_skin_dose_curve(d_curve, N0, k, alpha)
+
+        ax.plot(d_curve, ntcp_c * 100, color="#6A1B9A", lw=2,
+                label="Curva de referencia (piel 100% a dosis D)")
+
+        v    = st["NTCP_skin"]
+        dmax = st["D_max_Gy"]
+        dmean = st["D_mean_Gy"]
+
+        # Punto del plan real: NTCP de la distribución NO uniforme completa.
+        # Se ubica en D_mean (referencia de "carga" típica), no en D_max,
+        # porque la curva asume dosis uniforme y el plan real no lo es.
+        ax.plot(dmean, v * 100, "D", color="#E53935", ms=10, zorder=5,
+                label=f"Plan real (no uniforme): NTCP={v*100:.1f}%")
+        # Línea vertical punteada en D_max para referencia visual
+        if dmax <= d_max_ax:
+            ax.axvline(dmax, color="#E53935", ls=":", lw=1.0, alpha=0.5)
+            ax.annotate(f"D_max={dmax:.1f}", xy=(dmax, 2), fontsize=7.5,
+                        color="#B71C1C", rotation=90, va="bottom", ha="right")
+
+        # Bandas de referencia
+        if d_max_ax > 15:
+            ax.axvspan(15, min(18, d_max_ax), alpha=0.09, color="#FFA000",
+                       label="Umbral eritema/úlcera (15–18 Gy)")
+        if d_max_ax > 18:
+            ax.axvspan(18, min(20, d_max_ax), alpha=0.13, color="#E53935")
+
+        ax.set_xlabel("Dosis IsoE BNCT (fracción única) [Gy-Eq]", fontsize=9)
+        ax.set_ylabel("NTCP piel (%)", fontsize=9)
+        ax.set_title(f"NTCP piel — González et al. 2009 — {organ}", fontsize=9)
+        ax.set_xlim(0, d_max_ax); ax.set_ylim(0, 105)
+        ax.grid(True, color="#E0E0E0", lw=0.7)
+        ax.legend(fontsize=7.5, framealpha=0.88, loc="upper left")
+
+        note = (
+            "Nota: la curva asume toda la piel a dosis uniforme D. "
+            "El punto del plan usa la distribución real (no uniforme) "
+            "y por eso, en general, NO cae sobre la curva."
+        )
+        ax.text(0.5, -0.22, note, transform=ax.transAxes, ha="center",
+                va="top", fontsize=7, color="#607D8B", wrap=True)
+
+        self.fig.tight_layout(pad=1.2, rect=(0, 0.05, 1, 1))
+        self.canv.draw()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pestaña 3: TCP/NTCP clásico — Poisson + LKB
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _ClassicTab(QtWidgets.QWidget):
+    """
+    Layout simple: scroll con todo el contenido.
+    No tiene gráfico, así que no necesita splitter.
+    """
+
+    def __init__(self, parent, iso_vox: dict, sigma_vox: dict,
+                 isoe_params_by_organ: dict):
+        super().__init__(parent)
+        self.iso_vox      = iso_vox
+        self.sigma_vox    = sigma_vox
+        self.isoe_params  = isoe_params_by_organ
+        self._last_tbl: QtWidgets.QTableWidget | None = None
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        note = QtWidgets.QLabel(
+            "<b>Modelos clásicos:</b>  TCP = Poisson (Webb &amp; Nahum 1993)"
+            "  |  NTCP = LKB (Kutcher &amp; Burman 1989).<br>"
+            "Parámetros por defecto orientativos — ajustar según tejido."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#455A64; font-size:9pt;")
+        root.addWidget(note)
+
+        # Parámetros por órgano (en scroll)
+        gb  = QtWidgets.QGroupBox("Parámetros por órgano")
+        gbl = QtWidgets.QVBoxLayout(gb)
+
+        sc     = QtWidgets.QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setMaximumHeight(200)
+        sc.setFrameShape(QtWidgets.QFrame.NoFrame)
+        inner  = QtWidgets.QWidget()
+        f_lay  = QtWidgets.QFormLayout(inner)
+        f_lay.setHorizontalSpacing(8)
+        f_lay.setVerticalSpacing(4)
+
+        organs = sorted(iso_vox.keys())
+        self.organ_params: dict[str, dict] = {}
+
+        for org in organs:
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(4)
+
+            type_cb = QtWidgets.QComboBox()
+            type_cb.addItems(["OAR", "Tumor"])
+            if "tumor" in org.lower():
+                type_cb.setCurrentIndex(1)
+
+            sb_N0   = _dbl(1e7, 3); sb_N0.setRange(1.0, 1e12)
+            sb_td50 = _dbl(60.0, 1); sb_td50.setRange(1.0, 200.0)
+            sb_m    = _dbl(0.15, 3); sb_m.setRange(0.01, 1.0)
+            sb_n    = _dbl(0.10, 3); sb_n.setRange(0.001, 1.0)
+            sb_ab   = _dbl(3.0, 2);  sb_ab.setRange(0.1, 30.0)
+
+            for lbl_txt, sb in (
+                ("Tipo:", type_cb), ("N₀:", sb_N0), ("TD50:", sb_td50),
+                ("m:", sb_m), ("n:", sb_n), ("α/β:", sb_ab),
+            ):
+                row.addWidget(QtWidgets.QLabel(lbl_txt))
+                row.addWidget(sb)
+            row.addStretch()
+
+            self.organ_params[org] = {
+                "type_cb": type_cb, "sb_N0": sb_N0,
+                "sb_td50": sb_td50, "sb_m": sb_m,
+                "sb_n": sb_n, "sb_ab": sb_ab,
+            }
+            w = QtWidgets.QWidget(); w.setLayout(row)
+            f_lay.addRow(f"<b>{org}</b>:", w)
+
+        sc.setWidget(inner)
+        gbl.addWidget(sc)
+        root.addWidget(gb)
+
+        # Botón
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_calc = QtWidgets.QPushButton("Calcular TCP / NTCP clásico")
+        self.btn_calc.setStyleSheet(
+            "QPushButton{background:#2E7D32;color:white;font-weight:600;"
+            "padding:6px 20px;border-radius:4px;}"
+            "QPushButton:hover{background:#388E3C;}"
+        )
+        btn_row.addWidget(self.btn_calc)
+        btn_row.addStretch()
+        root.addLayout(btn_row)
+
+        # Contenedor para tabla de resultados
+        self._res_container = QtWidgets.QWidget()
+        self._res_lay       = QtWidgets.QVBoxLayout(self._res_container)
+        self._res_lay.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(self._res_container)
+        root.addStretch()
+
+        self.btn_calc.clicked.connect(self._calc)
+
+    def _calc(self):
+        rows = []
+        for org, w in self.organ_params.items():
+            A = np.asarray(self.iso_vox.get(org, []), float)
+            if A.size == 0:
+                continue
+            iso_p = self.isoe_params.get(org)
+            if iso_p is None:
+                continue
+
+            aR, bR, GR = iso_p.aR, iso_p.bR, iso_p.GR
+            t = w["type_cb"].currentText()
+
+            if t == "Tumor":
+                s = tcp_stats(A, aR, bR, GR, w["sb_N0"].value())
+                rows.append([org, "Tumor",
+                              f"{s['TCP']:.4f}", "—",
+                              f"{s['D_mean_Gy']:.2f}", f"{s['mean_S']:.4f}"])
+            else:
+                s = ntcp_stats(A, w["sb_td50"].value(),
+                               w["sb_m"].value(), w["sb_n"].value(),
+                               model="lkb")
+                rows.append([org, "OAR",
+                              "—", f"{s['NTCP']:.4f}",
+                              f"{s['D_mean_Gy']:.2f}", f"{s['gEUD_Gy']:.2f}"])
+
+        # Limpiar resultado anterior
+        if self._last_tbl is not None:
+            self._last_tbl.setParent(None)
+            self._last_tbl.deleteLater()
+            self._last_tbl = None
+
+        if not rows:
+            lbl = QtWidgets.QLabel("Sin resultados — revisar parámetros.")
+            self._res_lay.addWidget(lbl)
+            return
+
+        tbl = _make_table(
+            ["Órgano", "Tipo", "TCP", "NTCP", "D_mean [Gy_eq]", "S_mean / gEUD"],
+            rows,
+        )
+        self._last_tbl = tbl
+        self._res_lay.addWidget(tbl)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,399 +900,97 @@ def _find_ntcp_scale(A_arr, TD50, m, n, model, target, hi=30.0) -> float | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RadiobioDialog(QtWidgets.QDialog):
+    """
+    Ventana de análisis radiobiológico — TCP, NTCP y supervivencia.
+
+    Llamada desde ResultsDialog._open_radiobio_dialog().
+
+    Args:
+        report               : dict con IsoVoxel y SigmaIsoVoxel.
+        isoe_params_by_organ : dict {organ_key: IsoEParams} con aR, bR, GR.
+    """
 
     def __init__(self, parent, report: dict, isoe_params_by_organ: dict):
         super().__init__(parent)
-        self.setWindowTitle("Análisis Radiobiológico — TCP / NTCP / BED")
-        self.resize(980, 440)
+        self.setWindowTitle("Análisis Radiobiológico — TCP / NTCP")
+        self.resize(920, 760)
+        self.setMinimumSize(740, 600)
 
-        self.report               = report
-        self.isoe_params_by_organ = isoe_params_by_organ
-        self.radiobio_report: dict | None = None
-        self.organs = sorted(report.get("IsoVoxel", {}).keys())
+        iso_vox   = report.get("IsoVoxel", {})
+        sigma_vox = report.get("SigmaIsoVoxel", {})
 
-        self.rb_params: dict[str, RadiobioOrganParams] = {}
-        self._init_defaults()
-        self._tbl_w: dict[str, dict] = {}
-
-        self._build_ui()
-
-    # ── defaults ─────────────────────────────────────────────────────────────
-    def _init_defaults(self):
-        for organ in self.organs:
-            k = organ.lower()
-            if any(h in k for h in ["tumor","gtv","ctv","melanoma","glioma",
-                                      "neoplasia","carcinoma","cancer","gbm"]):
-                p = RadiobioOrganParams(organ_type="tumor", N0=1e7, alpha_beta=10.0)
-            elif any(h in k for h in ["cerebro","brain","encefalo"]):
-                p = RadiobioOrganParams(**vars(
-                    TISSUE_DEFAULTS.get("normal_brain", RadiobioOrganParams())))
-            elif any(h in k for h in ["spinal","medula","cord"]):
-                p = RadiobioOrganParams(**vars(
-                    TISSUE_DEFAULTS.get("spinal_cord", RadiobioOrganParams())))
-            elif any(h in k for h in ["skin","piel"]):
-                p = RadiobioOrganParams(**vars(
-                    TISSUE_DEFAULTS.get("skin", RadiobioOrganParams())))
-            else:
-                p = RadiobioOrganParams(organ_type="oar")
-            self.rb_params[organ] = p
-
-    # ── UI ───────────────────────────────────────────────────────────────────
-    def _build_ui(self):
         root = QtWidgets.QVBoxLayout(self)
-        root.setContentsMargins(6, 6, 6, 6)
+        root.setContentsMargins(8, 8, 8, 6)
         root.setSpacing(4)
 
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-
-        inner = QtWidgets.QWidget()
-        inner_layout = QtWidgets.QVBoxLayout(inner)
-        inner_layout.setContentsMargins(6, 6, 6, 4)
-        inner_layout.setSpacing(4)
-
-        self.tabs = QtWidgets.QTabWidget()
-        inner_layout.addWidget(self.tabs)
-
-        self.tabs.addTab(self._tab_config(),    "Configuración")
-        self.tabs.addTab(self._tab_results(),   "TCP / NTCP")
-        self.tabs.addTab(self._tab_bed(),       "BED / EQD2")
-
-        scroll.setWidget(inner)
-        root.addWidget(scroll, stretch=1)
-        brow = QtWidgets.QHBoxLayout()
-        brow.setContentsMargins(6, 0, 6, 0)
-        self.btn_calc = QtWidgets.QPushButton("▶  Calcular")
-        self.btn_calc.setDefault(True)
-        btn_close = QtWidgets.QPushButton("Cerrar")
-        brow.addWidget(self.btn_calc); brow.addStretch(); brow.addWidget(btn_close)
-        root.addLayout(brow)
-
-        self.btn_calc.clicked.connect(self._run)
-        btn_close.clicked.connect(self.accept)
-
-    # ── Tab 1 ─────────────────────────────────────────────────────────────────
-    def _tab_config(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        v.setContentsMargins(4, 4, 4, 4); v.setSpacing(4)
-
-        v.addWidget(_info(
-            "<b>Parámetros por órgano.</b> "
-            "Elegí <i>tumor</i> para calcular TCP (control tumoral) o "
-            "<i>oar</i> para NTCP (complicación en tejido sano).<br>"
-            "• <b>N₀</b>: cuántas células tiene el tumor (tumor). "
-            "• <b>TD₅₀</b>: dosis que daña el 50% de los pacientes (oar). "
-            "• <b>m</b>: qué tan pronunciada es la curva de complicación (0.1–0.2). "
-            "• <b>n</b>: importancia del volumen irradiado (≈0.05 médula, ≈0.87 pulmón). "
-            "• <b>α/β</b>: sensibilidad al fraccionamiento (alto=tumor, bajo=tejido tardío)."
-        ))
-
-        cols = ["Órgano","Tipo","N₀ (céls.)","TD₅₀ (Gy)","m","n","α/β (Gy)","Modelo NTCP"]
-        tbl = QtWidgets.QTableWidget(len(self.organs), len(cols))
-        tbl.setHorizontalHeaderLabels(cols)
-        tbl.verticalHeader().setVisible(False)
-        tbl.setAlternatingRowColors(True)
-        tbl.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
-        tbl.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        tbl.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-        tbl.horizontalHeader().setStretchLastSection(True)
-        self.config_tbl = tbl
-
-        for row, organ in enumerate(self.organs):
-            p = self.rb_params[organ]
-            rw: dict = {}
-
-            item = QtWidgets.QTableWidgetItem(organ)
-            item.setFlags(QtCore.Qt.ItemIsEnabled)
-            tbl.setItem(row, 0, item)
-
-            cb_type = QtWidgets.QComboBox()
-            cb_type.addItems(["oar","tumor"])
-            cb_type.setCurrentText(p.organ_type)
-            tbl.setCellWidget(row, 1, cb_type); rw["type"] = cb_type
-
-            sp_N0 = QtWidgets.QDoubleSpinBox()
-            sp_N0.setRange(1e3, 1e12); sp_N0.setDecimals(0); sp_N0.setSingleStep(1e6)
-            sp_N0.setValue(p.N0); sp_N0.setEnabled(p.organ_type == "tumor")
-            tbl.setCellWidget(row, 2, sp_N0); rw["N0"] = sp_N0
-
-            sp_td = QtWidgets.QDoubleSpinBox()
-            sp_td.setRange(1.0, 300.0); sp_td.setDecimals(1); sp_td.setValue(p.TD50)
-            sp_td.setEnabled(p.organ_type == "oar")
-            tbl.setCellWidget(row, 3, sp_td); rw["TD50"] = sp_td
-
-            sp_m = QtWidgets.QDoubleSpinBox()
-            sp_m.setRange(0.01, 1.0); sp_m.setDecimals(3); sp_m.setValue(p.m)
-            sp_m.setEnabled(p.organ_type == "oar")
-            tbl.setCellWidget(row, 4, sp_m); rw["m"] = sp_m
-
-            sp_n = QtWidgets.QDoubleSpinBox()
-            sp_n.setRange(0.001, 1.5); sp_n.setDecimals(3); sp_n.setValue(p.n)
-            sp_n.setEnabled(p.organ_type == "oar")
-            tbl.setCellWidget(row, 5, sp_n); rw["n"] = sp_n
-
-            sp_ab = QtWidgets.QDoubleSpinBox()
-            sp_ab.setRange(0.1, 50.0); sp_ab.setDecimals(1); sp_ab.setValue(p.alpha_beta)
-            tbl.setCellWidget(row, 6, sp_ab); rw["ab"] = sp_ab
-
-            cb_mod = QtWidgets.QComboBox()
-            cb_mod.addItems(["lkb","logistic"])
-            cb_mod.setCurrentText(p.ntcp_model)
-            cb_mod.setEnabled(p.organ_type == "oar")
-            tbl.setCellWidget(row, 7, cb_mod); rw["ntcp_model"] = cb_mod
-
-            def _sync(text, r=rw):
-                is_t = (text == "tumor")
-                r["N0"].setEnabled(is_t); r["TD50"].setEnabled(not is_t)
-                r["m"].setEnabled(not is_t); r["n"].setEnabled(not is_t)
-                r["ntcp_model"].setEnabled(not is_t)
-            cb_type.currentTextChanged.connect(_sync)
-            self._tbl_w[organ] = rw
-
-        v.addWidget(tbl, stretch=1)
-        return w
-
-    # ── Tab 2 ─────────────────────────────────────────────────────────────────
-    def _tab_results(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        v.setContentsMargins(4, 4, 4, 4); v.setSpacing(4)
-
-        v.addWidget(_info(
-            "<b>TCP</b> (control tumoral): probabilidad de que NINGUNA célula tumoral sobreviva. "
-            "Querés TCP → 100%.<br>"
-            "<b>NTCP</b> (complicación): probabilidad de daño clínico grave en tejido sano. "
-            "Querés NTCP → 0%.<br>"
-            "<b>gEUD</b>: dosis única equivalente con el mismo efecto biológico que la distribución real.<br>"
-            "<b>Factor D₅₀</b>: cuántas veces habría que multiplicar la dosis actual para llegar al 50% de TCP o NTCP. "
-            "Si es 1.4 → la dosis actual es el 71% de lo necesario para el 50% de efecto.<br>"
-            "<b>IC 90% (MC)</b>: intervalo de confianza calculado propagando la incertidumbre "
-            "de la dosis vóxel a vóxel. Solo aparece si el reporte tiene SigmaIsoVoxel."
-        ))
-
-        self.lbl_summary = QtWidgets.QLabel("")
-        self.lbl_summary.setStyleSheet("font-weight:bold; padding:4px; font-size:13px;")
-        v.addWidget(self.lbl_summary)
-
-        cols = ["Órgano","Tipo","TCP / NTCP","± σ (MC)","IC 90% (MC)",
-                "gEUD (Gy)","D_media (Gy)","D_max (Gy)","Factor D₅₀"]
-        self.tbl_r = QtWidgets.QTableWidget(0, len(cols))
-        self.tbl_r.setHorizontalHeaderLabels(cols)
-        self.tbl_r.verticalHeader().setVisible(False)
-        self.tbl_r.setAlternatingRowColors(True)
-        self.tbl_r.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.tbl_r.horizontalHeader().setStretchLastSection(True)
-        v.addWidget(self.tbl_r, stretch=1)
-
-        v.addWidget(_info(
-            "📈 <b>Curvas:</b> TCP/NTCP en función del factor de escala de la dosis. "
-            "El eje X se ajusta automáticamente para mostrar la zona sigmoidal de cada curva. "
-            "La línea vertical gris = dosis actual (escala 1)."
-        ))
-        self.canvas_rbc = MplCanvas(w, width=7, height=2.5)
-        v.addWidget(self.canvas_rbc)
-        return w
-
-    # ── Tab 4 ─────────────────────────────────────────────────────────────────
-    def _tab_bed(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        v.setContentsMargins(4, 4, 4, 4); v.setSpacing(4)
-
-        v.addWidget(_info(
-            "<b>BED</b> (Dosis Biológicamente Efectiva): mide el daño biológico total, "
-            "independientemente de si se irradia en una o muchas sesiones. "
-            "Fórmula: BED = A × (1 + A / (α/β)).<br>"
-            "<b>EQD2</b> (Equivalente en fracciones de 2 Gy): convierte la dosis BNCT "
-            "a cuánto sería si se hubiera administrado en sesiones de 2 Gy. "
-            "Permite comparar directamente con límites de la literatura de radioterapia: "
-            "p.ej. cerebro ≤ 60 Gy, médula espinal ≤ 45–50 Gy, piel ≤ 55 Gy.<br>"
-            "Todas las columnas en Gy fotónico equivalente. D₅₀ = mediana de la distribución."
-        ))
-
-        cols = ["Órgano","Tipo","α/β (Gy)",
-                "BED media","BED D₅₀","BED máx",
-                "EQD2 media","EQD2 D₅₀","EQD2 máx"]
-        self.tbl_b = QtWidgets.QTableWidget(0, len(cols))
-        self.tbl_b.setHorizontalHeaderLabels(cols)
-        self.tbl_b.verticalHeader().setVisible(False)
-        self.tbl_b.setAlternatingRowColors(True)
-        self.tbl_b.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.tbl_b.horizontalHeader().setStretchLastSection(True)
-        v.addWidget(self.tbl_b, stretch=1)
-        return w
-
-    # ── collect ───────────────────────────────────────────────────────────────
-    def _collect(self) -> dict[str, RadiobioOrganParams]:
-        out = {}
-        for organ, rw in self._tbl_w.items():
-            out[organ] = RadiobioOrganParams(
-                organ_type = rw["type"].currentText(),
-                N0         = float(rw["N0"].value()),
-                TD50       = float(rw["TD50"].value()),
-                m          = float(rw["m"].value()),
-                n          = float(rw["n"].value()),
-                alpha_beta = float(rw["ab"].value()),
-                ntcp_model = rw["ntcp_model"].currentText(),
-                run_mc     = True,
+        if not iso_vox:
+            root.addWidget(QtWidgets.QLabel(
+                "No hay datos de dosis isoefectiva.\n"
+                "Calculá en modo IsoE primero."
+            ))
+            root.addWidget(
+                QtWidgets.QPushButton("Cerrar", clicked=self.accept)
             )
-        return out
-
-    # ── run ───────────────────────────────────────────────────────────────────
-    def _run(self):
-        self.btn_calc.setEnabled(False)
-        self.btn_calc.setText("⏳ Calculando…")
-        QtWidgets.QApplication.processEvents()
-        try:
-            self.radiobio_report = compute_radiobio_report(
-                isoe_report          = self.report,
-                params_by_organ      = self._collect(),
-                isoe_params_by_organ = self.isoe_params_by_organ,
-                N_mc_samples         = 500,
-                run_mc               = True,
-            )
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Error", str(exc))
             return
-        finally:
-            self.btn_calc.setEnabled(True)
-            self.btn_calc.setText("▶  Calcular")
 
-        self._upd_results()
-        self._upd_bed()
-        self.tabs.setCurrentIndex(1)
-
-    # ── update Tab 2 ─────────────────────────────────────────────────────────
-    def _upd_results(self):
-        rep    = self.radiobio_report
-        summ   = rep.get("summary", {})
-        params = self._collect()
-        iso_vox = self.report.get("IsoVoxel", {})
-
-        # Resumen en lenguaje simple
-        tcp_t = summ.get("TCP_total")
-        max_n = summ.get("max_NTCP")
-        parts = []
-        if tcp_t is not None:
-            interp = ("excelente ✔" if tcp_t > 0.9 else
-                      "buena" if tcp_t > 0.5 else
-                      "insuficiente con estos parámetros ✗" if tcp_t < 0.01 else "parcial")
-            parts.append(f"TCP total: <b>{tcp_t:.1%}</b> ({interp})")
-        if max_n is not None:
-            interp = ("mínima ✔" if max_n < 0.05 else
-                      "moderada" if max_n < 0.20 else "alta ✗")
-            parts.append(f"NTCP máximo: <b>{max_n:.1%}</b> ({interp})")
-        self.lbl_summary.setText("   ".join(parts))
-
-        organs_data = rep.get("organs", {})
-        tbl = self.tbl_r
-        tbl.setRowCount(len(organs_data))
-
-
-        ax = self.canvas_rbc.ax
-        ax.clear()
-
-        for r, (organ, data) in enumerate(organs_data.items()):
-            otype  = data.get("organ_type", "oar")
-            iso_p  = self.isoe_params_by_organ.get(organ)
-            p_rb   = params.get(organ)
-            A      = np.asarray(iso_vox.get(organ, []), float)
-            color  = _COLORS[r % len(_COLORS)]
-            mc     = data.get("mc", {})
-
-            tbl.setItem(r, 0, _cell(organ, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter))
-            tbl.setItem(r, 1, _cell(otype))
-
-            if A.size > 0 and p_rb:
-                a_par = 1.0 / max(p_rb.n, 1e-6) if otype == "oar" else 1.0
-                tbl.setItem(r, 5, _cell(f"{geud(A, a_par):.2f}"))
-            else:
-                tbl.setItem(r, 5, _cell("—"))
-            tbl.setItem(r, 6, _cell(f"{np.mean(A):.2f}" if A.size > 0 else "—"))
-            tbl.setItem(r, 7, _cell(f"{np.max(A):.2f}"  if A.size > 0 else "—"))
-
-            if otype == "tumor" and "tcp" in data and iso_p and p_rb and A.size > 0:
-                val    = data["tcp"]["TCP"]
-                D_mean = float(np.mean(A))
-                tbl.setItem(r, 2, _cell(f"TCP = {val:.2%}"))
-                tbl.setItem(r, 3, _cell(f"±{mc.get('TCP_std',0):.2%}" if mc else "sin σ(A)"))
-                tbl.setItem(r, 4, _cell(
-                    f"[{mc.get('TCP_p5',val):.2%} – {mc.get('TCP_p95',val):.2%}]"
-                    if mc else "sin σ(A)"))
-
-                # Curva teórica TCP vs. dosis uniforme [Gy]
-                # Rango: 0 hasta 3× D_mean o hasta donde TCP > 99%
-                d_max  = max(D_mean * 3.5, 30.0)
-                dose_x = np.linspace(0.0, d_max, 400)
-                curve  = tcp_dose_curve(dose_x, iso_p.aR, iso_p.bR, iso_p.GR, p_rb.N0)
-                ax.plot(dose_x, curve * 100, color=color, lw=2,
-                        linestyle="--", label=f"TCP {organ}")
-                # Punto del plan actual: (D_mean, TCP_real)
-                ax.plot(D_mean, val * 100, "o", color=color, ms=8, zorder=5,
-                        label=f"Plan {organ} (D_m={D_mean:.1f} Gy, TCP={val:.1%})")
-                ax.axvline(D_mean, color=color, lw=0.8, linestyle=":", alpha=0.6)
-                tbl.setItem(r, 8, _cell(f"D_media = {D_mean:.1f} Gy"))
-
-            elif "ntcp" in data and p_rb and A.size > 0:
-                val   = data["ntcp"]["NTCP"]
-                a_par = 1.0 / max(p_rb.n, 1e-6)
-                g_eud = geud(A, a_par)
-                tbl.setItem(r, 2, _cell(f"NTCP = {val:.2%}"))
-                tbl.setItem(r, 3, _cell(f"±{mc.get('NTCP_std',0):.2%}" if mc else "sin σ(A)"))
-                tbl.setItem(r, 4, _cell(
-                    f"[{mc.get('NTCP_p5',val):.2%} – {mc.get('NTCP_p95',val):.2%}]"
-                    if mc else "sin σ(A)"))
-
-                # Curva teórica NTCP vs. dosis uniforme [Gy]
-                d_max  = max(p_rb.TD50 * 2.5, float(np.mean(A)) * 3.5, 30.0)
-                dose_x = np.linspace(0.0, d_max, 400)
-                curve  = ntcp_dose_curve(dose_x, p_rb.TD50, p_rb.m)
-                ax.plot(dose_x, curve * 100, color=color, lw=2,
-                        linestyle="-", label=f"NTCP {organ}")
-                # Punto del plan actual: (gEUD, NTCP_real)
-                ax.plot(g_eud, val * 100, "s", color=color, ms=8, zorder=5,
-                        label=f"Plan {organ} (gEUD={g_eud:.1f} Gy, NTCP={val:.1%})")
-                ax.axvline(g_eud, color=color, lw=0.8, linestyle=":", alpha=0.6)
-                tbl.setItem(r, 8, _cell(f"TD₅₀ = {p_rb.TD50:.0f} Gy"))
-
-            else:
-                for col in [2, 3, 4, 8]:
-                    tbl.setItem(r, col, _cell("—"))
-
-        tbl.resizeColumnsToContents()
-
-        ax.set_xlabel("Dosis acumulada uniforme (Gy fotónico equivalente)")
-        ax.set_ylabel("Probabilidad (%)")
-        ax.set_title(
-            "Curvas dosis-respuesta  —  TCP (- -) y NTCP (—)\n"
-            "Marcadores individuales representan la dosis/probabilidad del plan actual"
+        # Encabezado
+        n_org = len(iso_vox)
+        n_vox = sum(len(v) for v in iso_vox.values())
+        hdr = QtWidgets.QLabel(
+            f"<b>Análisis Radiobiológico BNCT</b>"
+            f"&nbsp;&nbsp;|&nbsp;&nbsp;{n_org} órganos"
+            f"&nbsp;&nbsp;|&nbsp;&nbsp;{n_vox:,} vóxeles totales"
         )
-        ax.set_ylim(-2, 105)
-        ax.legend(fontsize=7, framealpha=0.9, loc="upper left",
-                  bbox_to_anchor=(1.02, 1.0), ncol=1)
-        ax.grid(True, alpha=0.3)
-        self.canvas_rbc.fig.tight_layout(pad=1.0)
-        self.canvas_rbc.fig.subplots_adjust(right=0.75)
-        self.canvas_rbc.draw()
+        hdr.setStyleSheet("font-size:10pt; color:#263238;")
+        root.addWidget(hdr)
 
+        sep = QtWidgets.QFrame()
+        sep.setFrameShape(QtWidgets.QFrame.HLine)
+        sep.setStyleSheet("color:#B0BEC5;")
+        root.addWidget(sep)
 
-    # ── update Tab 4 ─────────────────────────────────────────────────────────
-    def _upd_bed(self):
-        tbl  = self.tbl_b
-        rows = [(org, d.get("organ_type","oar"), d["bed_eqd2"])
-                for org, d in self.radiobio_report.get("organs", {}).items()
-                if "bed_eqd2" in d]
-        tbl.setRowCount(len(rows))
-        for r, (organ, otype, b) in enumerate(rows):
-            tbl.setItem(r, 0, _cell(organ, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter))
-            tbl.setItem(r, 1, _cell(otype))
-            tbl.setItem(r, 2, _cell(f"{b.get('alpha_beta_used',0):.1f}"))
-            tbl.setItem(r, 3, _cell(f"{b.get('BED_mean', 0):.2f}"))
-            tbl.setItem(r, 4, _cell(f"{b.get('BED_D50',  0):.2f}"))
-            tbl.setItem(r, 5, _cell(f"{b.get('BED_max',  0):.2f}"))
-            tbl.setItem(r, 6, _cell(f"{b.get('EQD2_mean',0):.2f}"))
-            tbl.setItem(r, 7, _cell(f"{b.get('EQD2_D50', 0):.2f}"))
-            tbl.setItem(r, 8, _cell(f"{b.get('EQD2_max', 0):.2f}"))
-        tbl.resizeColumnsToContents()
+        # Pestañas — cada tab es directamente el widget (sin QScrollArea extra
+        # en el nivel del tab, porque cada tab ya gestiona su propio scroll)
+        tabs = QtWidgets.QTabWidget()
+        tabs.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+
+        tabs.addTab(
+            _TcpHkTab(self, iso_vox, sigma_vox),
+            "TCP Tumor  (HK + Martel)",
+        )
+        tabs.addTab(
+            _NtcpSkinTab(self, iso_vox, sigma_vox),
+            "NTCP Piel  (González 2009)",
+        )
+        tabs.addTab(
+            _ClassicTab(self, iso_vox, sigma_vox, isoe_params_by_organ),
+            "TCP / NTCP Clásico  (Poisson + LKB)",
+        )
+
+        root.addWidget(tabs, stretch=1)
+
+        # Referencias
+        ref = QtWidgets.QLabel(
+            "<small><b>Refs:</b> "
+            "González et al. 2009 (NTCP piel) · "
+            "Martel et al. 1999 (D50/γ NSCLC) · "
+            "González &amp; Santa Cruz 2012 (HK para BNCT) · "
+            "Park et al. 2008 (HK H460) · "
+            "Kutcher &amp; Burman 1989 (LKB) · "
+            "Webb &amp; Nahum 1993 (TCP Poisson)"
+            "</small>"
+        )
+        ref.setWordWrap(True)
+        ref.setStyleSheet("color:#607D8B;")
+        root.addWidget(ref)
+
+        # Botón cerrar
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch()
+        btn_close = QtWidgets.QPushButton("Cerrar")
+        btn_close.clicked.connect(self.accept)
+        btn_row.addWidget(btn_close)
+        root.addLayout(btn_row)

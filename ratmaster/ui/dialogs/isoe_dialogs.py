@@ -493,6 +493,10 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
         self._cmb_tissue_type.currentIndexChanged.connect(
             lambda _: self._update_tissue_warn()
         )
+        # [FIX] Señales de GR_mode y t_ref_s — necesarias para que _on_edited
+        # detecte cambios en estos nuevos controles y marque el preset como editado.
+        self._cmb_gr_mode.currentIndexChanged.connect(self._on_edited)
+        self._edit_tref.textChanged.connect(self._on_edited)
         self._btn_save.clicked.connect(self._save)
         self._btn_delete.clicked.connect(self._delete)
 
@@ -594,10 +598,12 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
     def _build_params_group(self) -> QtWidgets.QGroupBox:
         grp = QtWidgets.QGroupBox("Parámetros radiobiológicos (MLQ con sinergia)")
         vb = QtWidgets.QVBoxLayout(grp)
+        # [FIX] Descripción actualizada: GR ahora puede ser fijo o calculado desde
+        # t_ref_s. El comportamiento depende del selector GR_mode del grupo de reparación.
         vb.addWidget(_lbl(
             "Referencia fotónica (R): aR, bR, GR.   "
             "Componentes BNCT: aB, bB, aFn, bFn, aTh, bTh, aG, bG.   "
-            "GR = escalar fijo del experimento de referencia (≠ función de θ_BNCT).",
+            "GR: valor fijo O calculado desde t_ref (ver sección 'Modo de G_R de referencia' abajo).",
             "#455A64", italic=True, wrap=True,
         ))
         self._tbl_params = QtWidgets.QTableWidget(len(self.PARAM_KEYS), 3)
@@ -716,6 +722,72 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
             form1.addRow(lbl_w, ed)
         self._stack.addWidget(pg1)
         vb.addWidget(self._stack)
+
+        # [FIX] Sección de G_R de referencia.
+        # Antes no existía en la UI: GR_mode y t_ref_s eran ignorados al construir
+        # IsoEParams desde el formulario (se usaba siempre GR_mode="fixed").
+        # Ahora el usuario puede elegir entre:
+        #   "fixed"    → usa el valor de GR de la tabla de parámetros directamente.
+        #   "computed" → calcula G_R = G(t_ref_s, cinética lowLET del tejido),
+        #                reproduciendo el esquema de González 2012 / BNCTar.
+        vb.addWidget(_separator())
+        vb.addWidget(_lbl(
+            "Modo de G_R de referencia",
+            "#1A237E", bold=True,
+        ))
+        vb.addWidget(_lbl(
+            "G_R es el factor de Lea-Catcheside de la irradiación fotónica de REFERENCIA "
+            "(el experimento de calibración de αR/βR). "
+            "No depende del tiempo de irradiación BNCT.\n"
+            "• Fijo (legacy): usa el valor de GR de la tabla directamente. "
+            "Elegir GR=1 para referencia aguda (dosis única, flujo muy alto).\n"
+            "• Calculado desde t_ref: calcula G_R = G(t_ref, cinética lowLET) "
+            "— reproduce González 2012 / BNCTar. "
+            "Usar cuando la referencia fue entregada en minutos (ej: 30 min en RA-6).",
+            "#455A64", italic=True, wrap=True,
+        ))
+
+        row_grmode = QtWidgets.QHBoxLayout()
+        row_grmode.addWidget(_lbl("Modo G_R:", "#455A64"))
+        self._cmb_gr_mode = QtWidgets.QComboBox()
+        self._cmb_gr_mode.addItem("Fijo — usar valor de GR de la tabla",           "fixed")
+        self._cmb_gr_mode.addItem("Calculado desde t_ref (González 2012 / BNCTar)", "computed")
+        self._cmb_gr_mode.setToolTip(
+            "fixed:    G_R = valor de GR ingresado arriba. "
+            "Usar para referencia aguda (rayos X instantáneos → GR=1.0).\n"
+            "computed: G_R = G(t_ref_s, cinética lowLET). "
+            "Reproduce BNCTar/González 2012 cuando la referencia se entregó "
+            "en un tiempo finito (ej: 30 min de fotones de megavoltaje)."
+        )
+        row_grmode.addWidget(self._cmb_gr_mode, 1)
+        row_grmode.addStretch()
+        vb.addLayout(row_grmode)
+
+        # Widget de t_ref_s (visible solo en modo "computed")
+        self._grp_tref = QtWidgets.QWidget()
+        row_tref = QtWidgets.QHBoxLayout(self._grp_tref)
+        row_tref.setContentsMargins(0, 0, 0, 0)
+        row_tref.addWidget(_lbl("t_ref [s]:", "#455A64"))
+        self._edit_tref = QtWidgets.QLineEdit("1800.0")
+        self._edit_tref.setMaximumWidth(120)
+        self._edit_tref.setToolTip(
+            "Tiempo de irradiación fotónica de REFERENCIA [s].\n"
+            "González 2012 y BNCTar usan 1800 s (30 min).\n"
+            "Poner 0 para reproducir referencia aguda (G_R → 1.0)."
+        )
+        row_tref.addWidget(self._edit_tref)
+        lbl_tref_h = _lbl("", "#90A4AE", italic=True)
+        self._lbl_tref_h = lbl_tref_h  # para actualizar la etiqueta en horas
+        row_tref.addWidget(lbl_tref_h)
+        row_tref.addStretch()
+        vb.addWidget(self._grp_tref)
+
+        # Conectar el combo para mostrar/ocultar t_ref y actualizar etiqueta en horas
+        self._cmb_gr_mode.currentIndexChanged.connect(self._on_gr_mode_changed)
+        self._edit_tref.textChanged.connect(self._update_tref_label)
+        self._update_tref_label()    # inicializar etiqueta
+        self._on_gr_mode_changed()   # inicializar visibilidad
+
         return grp
 
     def _build_ref_section(self) -> QtWidgets.QVBoxLayout:
@@ -821,6 +893,24 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
                     )
                 self._update_t0h()
 
+            # [FIX] Cargar GR_mode y t_ref_s del preset.
+            # Antes estos campos no existían en la UI, por lo que al guardar un
+            # preset nuevo nunca se incluían, y al cargar uno existente se ignoraban.
+            # Ahora se leen del dict "params" del preset y se aplican a los controles.
+            gr_mode = params.get("GR_mode", "fixed")
+            idx_gr = self._cmb_gr_mode.findData(gr_mode)
+            self._cmb_gr_mode.blockSignals(True)
+            self._cmb_gr_mode.setCurrentIndex(max(idx_gr, 0))
+            self._cmb_gr_mode.blockSignals(False)
+
+            t_ref = float(params.get("t_ref_s", 1800.0))
+            self._edit_tref.blockSignals(True)
+            self._edit_tref.setText(f"{t_ref:.6g}")
+            self._edit_tref.blockSignals(False)
+
+            self._on_gr_mode_changed()   # actualizar visibilidad del widget t_ref
+            self._update_tref_label()    # actualizar etiqueta en horas
+
             self._edit_ref.setText(str(p.get("ref", "")))
             self._edit_organs.setText(", ".join(p.get("valid_organs", [])))
             self._edit_comments.setPlainText(p.get("comments", ""))
@@ -905,6 +995,25 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
                 f"Editando sobre «{self._selected}» — usar «Guardar como…» para crear un preset nuevo."
             )
 
+    # [FIX] Nuevo: controla la visibilidad del widget t_ref_s según el modo GR.
+    # En modo "fixed" el t_ref no tiene efecto físico, se oculta para no confundir.
+    # En modo "computed" se muestra y habilita para que el usuario ingrese el valor.
+    def _on_gr_mode_changed(self):
+        mode = (self._cmb_gr_mode.currentData() or "fixed")
+        self._grp_tref.setVisible(mode == "computed")
+        if not self._loading and _is_builtin_isoe_preset(self._selected):
+            self._lbl_info.setText(
+                f"Editando sobre «{self._selected}» — usar «Guardar como…» para crear un preset nuevo."
+            )
+
+    # [FIX] Nuevo: muestra el valor de t_ref en horas junto al campo en segundos.
+    def _update_tref_label(self):
+        try:
+            t = float(self._edit_tref.text().replace(",", "."))
+            self._lbl_tref_h.setText(f"= {t/3600:.3f} h")
+        except ValueError:
+            self._lbl_tref_h.setText("—")
+
     def _on_edited(self, *_):
         if self._loading:
             return
@@ -957,6 +1066,28 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
                 except ValueError as e:
                     raise ValueError(f"t0[{key}]: {e}")
 
+        # [FIX] Leer GR_mode y t_ref_s del formulario e incluirlos en params.
+        # Antes _read_form() nunca leía estos campos, por lo que al guardar un
+        # preset de usuario siempre quedaban con los defaults del constructor
+        # (GR_mode="fixed", t_ref_s=1800.0), ignorando lo que el usuario configuró.
+        gr_mode = self._cmb_gr_mode.currentData() or "fixed"
+        params["GR_mode"] = gr_mode
+        if gr_mode == "computed":
+            try:
+                t_ref = float(self._edit_tref.text().replace(",", "."))
+                if t_ref < 0:
+                    raise ValueError("t_ref_s debe ser ≥ 0.")
+            except ValueError as e:
+                raise ValueError(f"t_ref_s inválido: {e}")
+            params["t_ref_s"] = t_ref
+        else:
+            # En modo "fixed", t_ref_s no tiene efecto físico pero se guarda igual
+            # para que si el usuario cambia a "computed" en el futuro no pierda el valor.
+            try:
+                params["t_ref_s"] = float(self._edit_tref.text().replace(",", "."))
+            except ValueError:
+                params["t_ref_s"] = 1800.0
+
         ref           = self._edit_ref.text().strip()
         organs        = [x.strip() for x in self._edit_organs.text().split(",") if x.strip()]
         comments      = self._edit_comments.toPlainText().strip()
@@ -978,8 +1109,11 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
             (params, t0_map, ref, rm, organs, comments,
              tissue, tissue_type, model_system, endpoint,
              boron_compound, approx_level, approx_notes) = self._read_form()
+            # [FIX] Antes usaba NUMERIC_KEYS + BIEXP_KEYS + ["repair_model"],
+            # lo que rechazaba GR_mode y t_ref_s y hacía fallar la validación.
+            # Ahora usa ALL_KEYS que los incluye.
             IsoEParams(**{k: v for k, v in params.items()
-                          if k in IsoEParams.NUMERIC_KEYS + IsoEParams.BIEXP_KEYS + ["repair_model"]})
+                          if k in IsoEParams.ALL_KEYS})
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "IsoE — Error", f"Parámetros inválidos:\n{e}")
             return
@@ -1072,8 +1206,12 @@ class IsoEDialog(QtWidgets.QDialog):
         root = QtWidgets.QVBoxLayout(self)
         root.setSpacing(6)
         root.addWidget(_lbl(
-            "ℹ GR = factor de Lea-Catcheside de la irradiación de REFERENCIA fotónica "
-            "(escalar fijo, NO función de θ_BNCT). Usar GR = 1.0 para referencia aguda.",
+            # [FIX] Descripción actualizada: GR puede ser fijo o calculado.
+            # Este editor rápido solo permite modificar los valores numéricos;
+            # para cambiar GR_mode / t_ref_s usar «Gestionar presets IsoE».
+            "ℹ GR = factor de Lea-Catcheside de la irradiación de REFERENCIA fotónica. "
+            "Usar GR = 1.0 para referencia aguda. "
+            "Para activar G_R calculado desde t_ref usar «Gestionar presets IsoE».",
             "#1565C0", italic=True, wrap=True,
         ))
         self._tbl = QtWidgets.QTableWidget(len(self.PARAM_KEYS), 3)

@@ -29,12 +29,16 @@ MODELO FÍSICO
 
     La dosis isoefectiva A satisface:
         α_R A + G_R β_R A² = E_BNCT
-    (G_R es FIJO del experimento de referencia, no función de θ_BNCT)
+    G_R puede ser:
+        "fixed"    → escalar fijo del experimento de referencia (legacy)
+        "computed" → G_R = G(t_ref, cinética lowLET) — reproduce BNCTar
 
 CORRECCIONES respecto a versiones antiguas:
-    ✓ G_R escalar fijo (no recalculado con θ_BNCT)
+    ✓ G_R: modo "fixed" (legacy) o "computed" (reproduce BNCTar exactamente)
     ✓ Dmean: bisección escalar sobre media real de IsoE(t), no promedio de tiempos
-    ✓ Pesos G_ij por defecto = "sublethal" (proporcional a √β_i D_i, TDRA)
+    ✓ G_ij cruzados: forma exacta de González & Santa Cruz (2012), Apéndice II
+      (fracción de dosis D_i/(D_i+D_j)) para cinética biexponencial.
+      Para cinética monoexponencial se usa pair_weights() con scheme="dose".
     ✓ Soporte para cinética biexponencial por órgano
     ✓ Auto-asignación de preset por tipo de tejido
     ✓ compute_isoe_from_report acepta params_by_organ
@@ -174,8 +178,19 @@ PARAM_DESCRIPTIONS: dict[str, tuple[str, str, str]] = {
            "fraccionamiento del tejido de referencia."),
     "GR": ("G_R", "—",
            "Factor de Lea-Catcheside de la IRRADIACIÓN FOTÓNICA DE REFERENCIA. "
-           "Es un ESCALAR FIJO del experimento de calibración, NO depende del "
-           "tiempo de irradiación BNCT. Usar 1.0 si la referencia es aguda."),
+           "Solo activo cuando GR_mode='fixed'. Usar 1.0 para referencia aguda. "
+           "Cuando GR_mode='computed', este valor es ignorado: G_R se calcula "
+           "automáticamente desde t_ref_s y la cinética lowLET del tejido."),
+    "GR_mode": ("GR_mode", "—",
+                "Modo de cálculo de G_R de referencia. "
+                "'fixed': usa el valor de GR directamente (legacy, por defecto). "
+                "'computed': calcula G_R = G(t_ref_s, cinética lowLET), "
+                "reproduciendo el esquema de BNCTar/González 2012."),
+    "t_ref_s": ("t_ref", "s",
+                "Tiempo de irradiación fotónica de REFERENCIA [s]. "
+                "Solo relevante cuando GR_mode='computed'. "
+                "González 2012 usa 30 min = 1800 s. "
+                "Poner 0.0 para reproducir referencia aguda (G_R → 1.0)."),
     "aB": ("α_Boro", "Gy⁻¹",
            "Componente lineal para DOSIS DE BORO (partículas α/⁷Li de la reacción "
            "¹⁰B(n,α)). Alta LET → α_B >> α_R. Derivado de ajuste a supervivencia "
@@ -243,6 +258,16 @@ class IsoEParams:
         "pf_lowLET", "ps_lowLET",
         "pf_highLET", "ps_highLET",
     ]
+    # [FIX] META_KEYS: claves que controlan el modo de cálculo de G_R y el tiempo
+    # de referencia. Antes no estaban en ninguna lista y build_params_by_organ las
+    # filtraba silenciosamente, dejando GR_mode="fixed" (default) aunque el preset
+    # dijera "computed". Esto causaba ~470 s de diferencia respecto al script de
+    # validación. Ahora se exponen aquí para que cualquier función que construya
+    # IsoEParams desde un dict pueda usar IsoEParams.ALL_KEYS como whitelist completa.
+    META_KEYS: list[str] = ["repair_model", "GR_mode", "t_ref_s"]
+    # ALL_KEYS: unión de todas las claves válidas — usar en build_params_by_organ
+    # y en cualquier serialización/deserialización de IsoEParams.
+    ALL_KEYS: list[str] = NUMERIC_KEYS + BIEXP_KEYS + META_KEYS
 
     def __init__(
         self,
@@ -259,6 +284,8 @@ class IsoEParams:
         ps_lowLET: float  = _BIEXP_PS_LOWLET,
         pf_highLET: float = _BIEXP_PF_HIGHLET,
         ps_highLET: float = _BIEXP_PS_HIGHLET,
+        GR_mode: str = "fixed",
+        t_ref_s: float = 1800.0,
     ):
         self.aR  = float(aR);  self.bR  = float(bR);  self.GR  = float(GR)
         self.aB  = float(aB);  self.bB  = float(bB)
@@ -273,6 +300,13 @@ class IsoEParams:
         self.ps_lowLET  = float(ps_lowLET)
         self.pf_highLET = float(pf_highLET)
         self.ps_highLET = float(ps_highLET)
+        # GR_mode: "fixed"    → usa self.GR directamente (legacy, por defecto)
+        #          "computed"  → calcula G_R desde t_ref_s y la cinética lowLET
+        self.GR_mode = str(GR_mode)
+        # t_ref_s: tiempo de irradiación fotónica de referencia [s]
+        # Solo relevante cuando GR_mode == "computed".
+        # 0.0 → referencia aguda (G_R = 1.0). 1800.0 → 30 min (González 2012).
+        self.t_ref_s = float(t_ref_s)
 
     def copy(self) -> "IsoEParams":
         return IsoEParams(**self.to_dict())
@@ -281,10 +315,13 @@ class IsoEParams:
         d = {k: getattr(self, k) for k in self.NUMERIC_KEYS}
         d["repair_model"] = self.repair_model
         d.update({k: getattr(self, k) for k in self.BIEXP_KEYS})
+        d["GR_mode"] = self.GR_mode
+        d["t_ref_s"] = self.t_ref_s
         return d
 
     def __repr__(self) -> str:
         return (f"IsoEParams(aR={self.aR}, bR={self.bR}, GR={self.GR}, "
+                f"GR_mode={self.GR_mode!r}, t_ref_s={self.t_ref_s}, "
                 f"aB={self.aB}, aTh={self.aTh}, aFn={self.aFn}, "
                 f"repair_model={self.repair_model!r})")
 
@@ -324,8 +361,53 @@ ISOE_PARAM_PRESETS: dict[str, dict] = {
         "params":             None,
         "t0_map":             None,
     },
+    "Tumor_DHD": {
+        "ref": (
+            "BIANCA fit, Università di Pavia"
+        ),
+        "tissue":         "Tumor",
+        "tissue_type":    "tumor",
+        "valid_organs":   [
+            "Tumor"
+        ],
+        "model_system": (
+            "—"
+        ),
+        "endpoint": (
+            "—"
+        ),
+        "boron_compound": "—",
+        "approximation_level": "full",
+        "approx_notes": (
+            "aTh = aFn, bTh = bFn (LET similar entre n térmicos y rápidos). aR = aG, bR = bG (fotones de referencia ≈ gamma del haz). GR = 1.0 (referencia aguda)."
+        
+        ),
+        "comments": (
+            ""
+          
+        ),
+        "params": {
+            "aR":  0.0342, "bR": 0.0286, "GR": 0.95,
+            "aG":  0.0342, "bG": 0.0286,
+            "aFn": 0.3759, "bFn": 0,
+            "aTh": 0.3759, "bTh": 0,
+            "aB": 1.2178, "bB": 0,
+            "repair_model": "biexp",
+            "t0f_s": 3200,
+            "t0s_s": 3200,
+            "pf_lowLET": 0.5,
+            "ps_lowLET": 0.5,
+            "pf_highLET": 0.5,
+            "ps_highLET": 0.5,
+            # G_R calculado desde el protocolo de referencia fotónica (no parámetro fijo).
+            # t_ref = 1800 s (30 min): tiempo representativo de la irradiación de referencia
+            # usado en el modelo publicado. Verificar con la fuente de αR/βR del preset.
+            "GR_mode": "computed", "t_ref_s": 3200.0,
+        },
+        "t0_map": None,
+    },
 
-    "Gonzalez2012_GS9L": {
+    "GS9L_Gonzalez2012": {
         "ref": (
             "González SJ & Santa Cruz GA. The photon-isoeffective dose in BNCT. "
             "Radiat. Res. 178 (2012) pp. 609-621. Tabla II — 9L rat gliosarcoma, "
@@ -364,7 +446,7 @@ ISOE_PARAM_PRESETS: dict[str, dict] = {
         },
     },
 
-    "Gonzalez2012_MelJ": {
+    "MelJ_Gonzalez2012": {
         "ref": (
             "González SJ & Santa Cruz GA. The photon-isoeffective dose in BNCT. "
             "Radiat. Res. 178 (2012) pp. 609-621. Tabla III — Mel-J (melanoma "
@@ -402,7 +484,7 @@ ISOE_PARAM_PRESETS: dict[str, dict] = {
         },
     },
 
-    "Dattoli2025_CerebroNormal": {
+    "CerebroNormal_Dattoli2025": {
         "ref": (
             "Dattoli Viegas AM, Carando D, Koivunoro H, Joensuu H, González SJ. "
             "Predicting radiotoxic effects after BNCT for brain cancer using a "
@@ -445,16 +527,171 @@ ISOE_PARAM_PRESETS: dict[str, dict] = {
         "params": {
             "aR": 1.0, "bR": 0.5, "GR": 1.0,
             "aG": 1.0, "bG": 0.5,
-            "aFn": 36.0, "bFn": 0.0,
-            "aTh": 36.0, "bTh": 0.0,
-            "aB": 20.0, "bB": 1.0,
+            "aFn": 36.359, "bFn": 0.0,
+            "aTh": 36.359, "bTh": 0.0,
+            "aB": 21.7180, "bB": 0.8274,
             "repair_model": "biexp",
-            "t0f_s": 2520.0, "t0s_s": 13680.0,
+            "t0f_s": 2520, "t0s_s": 13680,
             "pf_lowLET": 0.38, "ps_lowLET": 0.62,
-            "pf_highLET": 0.20, "ps_highLET": 0.80,
+            "pf_highLET": 0.80, "ps_highLET": 0.20,
+            # G_R calculado desde el protocolo de referencia fotónica (no parámetro fijo).
+            # t_ref = 1800 s (30 min): tiempo representativo de la irradiación de referencia
+            # usado en el modelo publicado. Verificar con la fuente de αR/βR del preset.
+            "GR_mode": "computed", "t_ref_s": 1800.0,
         },
         "t0_map": None,
     },
+
+    "Medula_Dattoli2025": {
+        "ref": (
+            "Dattoli Viegas AM, Carando D, Koivunoro H, Joensuu H, González SJ. "
+            "Predicting radiotoxic effects after BNCT for brain cancer using a "
+            "novel dose calculation model (2025). Tabla 2 — Médula espinal de rata, "
+            "CON sinergia, cinética biexponencial."
+        ),
+        "tissue":         "Médula espinal (rata, SNC tardío)",
+        "tissue_type":    "spinal_cord",
+        "valid_organs":   [
+            "Medula", "MedulaEspinal", "SpinalCord",
+        ],
+        "model_system": (
+            "Rata, médula espinal: fotones megavoltaje (Ang et al. 1987/1992, "
+            "N=376 animales) y BNCT-BPA (Morris et al. 1994, BMRR, N=67 animales)."
+        ),
+        "endpoint": (
+            "Parálisis de miembros (ED₅₀). NTCP Lyman: TD₅₀ = 23.04 Gy, m = 0.044. "
+            "Efecto tardío (necrosis de sustancia blanca)."
+        ),
+        "boron_compound": "BPA intragástrico, 1500 mg/kg; ¹⁰B CNS = 10.0 ± 0.5 µg/g",
+        "approximation_level": "full",
+        "approx_notes": (
+            "• Mismos parámetros que el preset «CerebroNormal_Dattoli2025»: en el "
+            "paper ambos tejidos (cerebro normal y médula espinal) se reportan con "
+            "el mismo ajuste de Tabla 2, derivado de los datos de médula espinal de "
+            "rata (Ang et al. 1987/1992; Morris et al. 1994) — no hay un set de "
+            "parámetros separado para cerebro.\n"
+            "• Múltiples tiempos de reparación: t₀f = 0.7 h (rápida), "
+            "t₀s = 3.8 h (lenta) — LET-independientes (Schmid et al. 2010).\n"
+            "• Fracciones LET-específicas: low-LET (γ/ref) pf = 0.38, ps = 0.62; "
+            "high-LET (B, Th, Fn) pf = 0.20, ps = 0.80 (Ang et al. 1992).\n"
+            "• Parámetros normalizados: αR = 1.0 Gy⁻¹, α/β = 2 Gy → βR = 0.5 Gy⁻².\n"
+            "• Ai = αi/αR, Bi = βi/αR según Tabla 2.\n"
+            "• bFn = bTh ≈ 0 (neutrones actúan de forma lineal pura).\n"
+            "• GR = 1.0 (referencia de megavoltaje, irradiación aguda)."
+        ),
+        "comments": (
+            "Mismo modelo que «CerebroNormal_Dattoli2025», separado como preset "
+            "propio para que tissue_type coincida con la categoría «Médula "
+            "espinal» y no dispare la advertencia de incompatibilidad de tejido "
+            "en la UI. Validado contra datos clínicos de somnolencia post-BNCT "
+            "(Helsinki, FiR1 y BNL/Harvard-MIT). El DIsoE resultante está en Gy "
+            "equivalente fotónico de megavoltaje. NO aplicar a volúmenes tumorales."
+        ),
+        "params": {
+            "aR": 1.0, "bR": 0.5, "GR": 1.0,
+            "aG": 1.0, "bG": 0.5,
+            "aFn": 36.359, "bFn": 0.0,
+            "aTh": 36.359, "bTh": 0.0,
+            "aB": 21.7180, "bB": 0.8274,
+            "repair_model": "biexp",
+            "t0f_s": 2520, "t0s_s": 13680,
+            "pf_lowLET": 0.38, "ps_lowLET": 0.62,
+            "pf_highLET": 0.80, "ps_highLET": 0.20,
+            # G_R calculado desde el protocolo de referencia fotónica (no parámetro fijo).
+            # t_ref = 1800 s (30 min): tiempo representativo de la irradiación de referencia
+            # usado en el modelo publicado. Verificar con la fuente de αR/βR del preset.
+            "GR_mode": "computed", "t_ref_s": 1800.0,
+        },
+        "t0_map": None,
+    },
+
+    "Piel_Dattoli2026": {
+        "ref": (
+            "An extended photon isoeffective dose model accounting"
+            "for the energy-dependent effectiveness of secondary"
+            "charged particles in BNCT (Dattoli Viegas et al. 2026). "
+        ),
+        "tissue":         "Piel",
+        "tissue_type":    "skin",
+        "valid_organs":   [
+            "Piel", "piel", "Skin"
+        ],
+        "model_system": (
+            "—"
+        ),
+        "endpoint": (
+            "—"
+        ),
+        "boron_compound": "—",
+        "approximation_level": "full",
+        "approx_notes": (
+            "aTh = aFn, bTh = bFn (LET similar entre n térmicos y rápidos). aR = aG, bR = bG (fotones de referencia ≈ gamma del haz). GR = 1.0 (referencia aguda)."
+        
+        ),
+        "comments": (
+            ""
+          
+        ),
+        "params": {
+            "aR": 0.1696, "bR": 0.0454, "GR": 1.0,
+            "aG": 0.1696, "bG": 0.0454,
+            "aFn": 1.5382, "bFn": 0.0516,
+            "aTh": 1.5382, "bTh": 0.0516,
+            "aB": 2.0028, "bB": 0.0037,
+            "repair_model": "biexp",
+            "t0f_s": 2164, "t0s_s": 6751.8,
+            "pf_lowLET": 0.8, "ps_lowLET": 0.2,
+            "pf_highLET": 0.35, "ps_highLET": 0.65,
+            # G_R calculado desde el protocolo de referencia fotónica (no parámetro fijo).
+            # t_ref = 1800 s (30 min): tiempo representativo de la irradiación de referencia
+            # usado en el modelo publicado. Verificar con la fuente de αR/βR del preset.
+            "GR_mode": "computed", "t_ref_s": 1800.0,
+        },
+        "t0_map": None,
+    },
+    "Pulmon_Normal": {
+        "ref": (
+            "BIANCA fit, Università di Pavia"
+        ),
+        "tissue":         "Pulmón normal",
+        "tissue_type":    "normal_lung",
+        "valid_organs":   [
+            "Pulmon", "PulmonTotal", "PulmonIzq", "PulmonDer", "Lung","Pulmon Izquierdo", "Pulmon Derecho"
+        ],
+        "model_system": (
+            "—"
+        ),
+        "endpoint": (
+            "—"
+        ),
+        "boron_compound": "—",
+        "approximation_level": "full",
+        "approx_notes": (
+            "aTh = aFn, bTh = bFn (LET similar entre n térmicos y rápidos). aR = aG, bR = bG (fotones de referencia ≈ gamma del haz). GR = 1.0 (referencia aguda)."
+        
+        ),
+        "comments": (
+            ""
+          
+        ),
+        "params": {
+            "aR":  0.112, "bR": 0.03, "GR": 1.0,
+            "aG":  0.112, "bG": 0.03,
+            "aFn": 0.7456, "bFn": 0.0183,
+            "aTh": 0.7456, "bTh": 0.0183,
+            "aB": 0.9242, "bB": 0.009,
+            "repair_model": "biexp",
+            "t0f_s": 1440, "t0s_s": 14436,
+            "pf_lowLET": 0.8, "ps_lowLET": 0.2,
+            "pf_highLET": 0.2, "ps_highLET": 0.8,
+            # G_R calculado desde el protocolo de referencia fotónica (no parámetro fijo).
+            # t_ref = 1800 s (30 min): tiempo representativo de la irradiación de referencia
+            # usado en el modelo publicado. Verificar con la fuente de αR/βR del preset.
+            "GR_mode": "computed", "t_ref_s": 1800.0,
+        },
+        "t0_map": None,
+    },
+    
 }
 
 
@@ -490,25 +727,60 @@ def get_presets_for_tissue(tissue_type: str) -> list[str]:
     ]
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# PREFERENCIAS DE AUTO-ASIGNACIÓN POR ÓRGANO
+# ──────────────────────────────────────────────────────────────────────────────
+# Cuando hay varios presets válidos para el mismo órgano (mismo tissue_type),
+# get_presets_for_organ no tenía forma de saber cuál preferís como primera
+# opción: el desempate caía en orden alfabético del nombre del preset. Por
+# eso "Tumor" auto-asignaba GS9L_Gonzalez2012 en vez de Tumor_DHD (G < T).
+#
+# ORGAN_PRESET_PREFERENCE define, por órgano, el o los presets que querés
+# que el auto-asignado elija primero. Es una lista (no un solo string) para
+# poder tener más de un preset preferido por órgano: el primero de la lista
+# que también sea válido para ese órgano gana; si ninguno aplica, se cae al
+# desempate por defecto (tissue_type + alfabético).
+#
+# Para agregar preferencia en un órgano nuevo, alcanza con una entrada
+# acá — no hace falta tocar get_presets_for_organ ni auto_assign_presets.
+ORGAN_PRESET_PREFERENCE: dict[str, list[str]] = {
+    "Tumor": ["Tumor_DHD"],
+    "Medula": ["Medula_Dattoli2025"],
+    # Ejemplo para extender a otro órgano con más de un preset preferido,
+    # en orden de prioridad (el primero que aplique gana):
+    # "Piel": ["Piel_Dattoli2026", "OtroPresetDePiel"],
+}
+
+
 def get_presets_for_organ(organ_name: str) -> list[str]:
     """
     Lista de presets cuyo valid_organs incluye organ_name,
     o cuyos valid_organs están vacíos (aplicable a cualquier órgano).
-    Excluye "Manual". Ordenados por coincidencia de tissue_type.
+    Excluye "Manual". Ordenados por:
+        1. Preferencia explícita en ORGAN_PRESET_PREFERENCE (si existe).
+        2. Coincidencia de tissue_type.
+        3. Nombre del preset (alfabético, desempate final).
     """
     detected_tt = detect_tissue_type(organ_name)
-    matches: list[tuple[int, str]] = []
+    preferred = ORGAN_PRESET_PREFERENCE.get(organ_name, [])
+    matches: list[tuple[int, int, str]] = []
     for name, p in ISOE_PARAM_PRESETS.items():
         if name == "Manual":
             continue
         valid = p.get("valid_organs", [])
         if valid and organ_name not in valid:
             continue
-        # Prioridad: mismo tissue_type primero
-        priority = 0 if p.get("tissue_type") == detected_tt else 1
-        matches.append((priority, name))
+        # Prioridad 1: posición en la lista de preferencia del órgano
+        # (0 = primer preferido, 1 = segundo preferido, ..., N = sin preferencia).
+        if name in preferred:
+            pref_rank = preferred.index(name)
+        else:
+            pref_rank = len(preferred)
+        # Prioridad 2: mismo tissue_type primero
+        tt_rank = 0 if p.get("tissue_type") == detected_tt else 1
+        matches.append((pref_rank, tt_rank, name))
     matches.sort()
-    return [name for _, name in matches]
+    return [name for _, _, name in matches]
 
 
 def auto_assign_presets(organ_list: list[str]) -> dict[str, str | None]:
@@ -560,9 +832,17 @@ def build_params_by_organ(
         if not raw_params:
             continue
         try:
+            # [FIX] Antes: filtraba con NUMERIC_KEYS + BIEXP_KEYS + ["repair_model"],
+            # lo que descartaba silenciosamente "GR_mode" y "t_ref_s".
+            # Consecuencia: IsoEParams quedaba con GR_mode="fixed" (default del
+            # constructor) aunque el preset dijera "computed", causando ~470 s de
+            # diferencia en solve_time_isoe_from_constraints respecto al script de
+            # validación.
+            # Ahora: se usa ALL_KEYS que incluye META_KEYS = ["repair_model",
+            # "GR_mode", "t_ref_s"], preservando el modo de cálculo correcto.
             p = IsoEParams(**{
                 k: v for k, v in raw_params.items()
-                if k in IsoEParams.NUMERIC_KEYS + IsoEParams.BIEXP_KEYS + ["repair_model"]
+                if k in IsoEParams.ALL_KEYS
             })
             result[organ] = p
         except Exception:
@@ -619,6 +899,54 @@ def lea_catcheside_biexp_vec(theta: np.ndarray, t0f: float, t0s: float,
     return pf * lea_catcheside_vec(theta, t0f) + ps * lea_catcheside_vec(theta, t0s)
 
 
+def compute_GR(p: "IsoEParams", t0_map: dict) -> float:
+    """
+    Calcula G_R del experimento fotónico de referencia (escalar fijo).
+
+    Reproduce el esquema de González 2012 / BNCTar:
+        G_R = pf_lowLET·G(t_ref, t0f) + ps_lowLET·G(t_ref, t0s)   [biexp]
+        G_R = G(t_ref, t0_R)                                         [monoexp]
+
+    El tiempo de referencia t_ref (p.t_ref_s) corresponde al tiempo de
+    irradiación fotónica del experimento de calibración (30 min en González 2012).
+    Si p.t_ref_s es None o no existe, se usa 1800.0 s (30 min) como valor
+    por defecto, que corresponde al tiempo representativo de la irradiación
+    de referencia aguda de González 2012 (Apéndice I).
+
+    Notas:
+        - Para referencia AGUDA (dosis única instantánea), t_ref → 0 ⟹ G_R → 1.0.
+          Fijar p.t_ref_s = 0.0 reproduce el comportamiento de GR = 1.0.
+        - Este valor reemplaza al parámetro estático GR de IsoEParams cuando
+          se activa el modo 'computed' (p.GR_mode == 'computed').
+        - La cinética usada para G_R es siempre la de bajo LET (pf_lowLET,
+          ps_lowLET), porque la referencia son fotones (bajo LET).
+    """
+    t_ref = getattr(p, "t_ref_s", None)
+    if t_ref is None:
+        t_ref = 1800.0   # 30 min — González 2012 Apéndice I
+
+    t_ref = float(t_ref)
+
+    if p.repair_model == "biexp":
+        return lea_catcheside_biexp(t_ref, p.t0f_s, p.t0s_s, p.pf_lowLET, p.ps_lowLET)
+    else:
+        t0_R = t0_map.get("R", _T0_MONO_DEFAULT_S)
+        return lea_catcheside(t_ref, t0_R)
+
+
+def _resolve_GR(p: "IsoEParams", t0_map: dict) -> float:
+    """
+    Retorna el G_R efectivo a usar en la inversión IsoE.
+
+    Si p.GR_mode == 'computed': calcula G_R desde t_ref y la cinética del tejido.
+    Si p.GR_mode == 'fixed' (o ausente):  usa p.GR directamente (comportamiento legacy).
+    """
+    mode = getattr(p, "GR_mode", "fixed")
+    if mode == "computed":
+        return compute_GR(p, t0_map)
+    return float(p.GR)
+
+
 def _G_components(theta_s: float, p: IsoEParams, t0_map: dict) -> dict:
     """G_i(θ) por componente (escalar). NO incluye 'R' — GR = p.GR (fijo)."""
     if p.repair_model == "biexp":
@@ -639,16 +967,50 @@ def _G_components_vec(theta: np.ndarray, p: IsoEParams, t0_map: dict) -> dict:
             for k in ("Boro", "Fstn", "Thn", "Gamma")}
 
 
+def _Gij_cross(Di, Dj, pf_i: float, pf_j: float,
+               Gf, Gs) -> np.ndarray:
+    """
+    Factor de Lea-Catcheside cruzado G_ij para un par de componentes BNCT.
+
+    Para componentes i, j irradiados simultáneamente durante θ:
+
+        a_ij = D_i / (D_i + D_j)    fracción de dosis del componente i
+        a_ji = D_j / (D_i + D_j)
+
+        G_ij = G_s - (a_ij · pf_i + a_ji · pf_j) · (G_s - G_f)
+
+    donde:
+        G_f = G(θ, τ_f)   extremo rápido de la cinética biexponencial
+        G_s = G(θ, τ_s)   extremo lento
+        pf_i               fracción de componente rápida del componente i
+                           (pf_highLET para Boro/Thn/Fstn, pf_lowLET para γ)
+
+    Cuando Di + Dj ≈ 0 en un vóxel, G_ij → G_s (la contribución al término
+    cuadrático es nula de todas formas en ese vóxel).
+    """
+    Di_ = np.asarray(Di, float)
+    Dj_ = np.asarray(Dj, float)
+    eps = 1e-30
+    s   = np.maximum(eps, Di_ + Dj_)
+    a_ij = Di_ / s
+    a_ji = Dj_ / s
+    return Gs - (a_ij * pf_i + a_ji * pf_j) * (Gs - Gf)
+
+
+# Se mantiene pair_weights como API de compatibilidad (monoexp / igual / dosis).
 def pair_weights(Di, Dj, bi: float, bj: float,
-                 scheme: str = "sublethal") -> tuple:
+                 scheme: str = "dose") -> tuple:
     """
     Pesos (a_i, a_j) para G_ij = a_i·G_i + a_j·G_j.
 
-    "sublethal" (recomendado, TDRA): a_i ∝ √β_i · D_i
-    "dose":  a_i ∝ D_i
+    NOTA: Para cinética biexponencial usar _Gij_cross() directamente,
+    que reproduce la Ec. A5 de González & Santa Cruz (2012).
+
+    "dose"  (González 2012, default): a_i = D_i / (D_i + D_j)
     "equal": a_i = a_j = 0.5
+    "sublethal": a_i = sqrt(max(bi, 0.0)) * D_i / (sqrt(max(bi, 0.0)) * D_i + sqrt(max(bj, 0.0)) * D_j)
     """
-    eps = 1e-30
+    eps = 1e-50
     if scheme == "sublethal":
         if float(bi) == 0.0 and float(bj) == 0.0:
             return 0.5, 0.5
@@ -685,28 +1047,53 @@ def _make_cmix_vec(p: IsoEParams, t0_map: dict, scheme: str):
         Gi = _G_components_vec(theta, p, t0_map)
         C += (Gi["Boro"]*bB*dB*dB + Gi["Fstn"]*bFn*dF*dF +
               Gi["Thn"]*bTh*dT*dT + Gi["Gamma"]*bG*dG*dG)
-        for Di, Dj, bi, bj, ni, nj in [
-            (dB, dF, bB,  bFn, "Boro",  "Fstn"),
-            (dB, dT, bB,  bTh, "Boro",  "Thn"),
-            (dB, dG, bB,  bG,  "Boro",  "Gamma"),
-            (dF, dT, bFn, bTh, "Fstn",  "Thn"),
-            (dF, dG, bFn, bG,  "Fstn",  "Gamma"),
-            (dT, dG, bTh, bG,  "Thn",   "Gamma"),
-        ]:
-            ai, aj = pair_weights(Di, Dj, bi, bj, scheme)
-            Gij = ai*Gi[ni] + aj*Gi[nj]
-            C += 2.0 * Gij * sqrt(max(bi, 0.0)) * sqrt(max(bj, 0.0)) * Di * Dj
+        if p.repair_model == "biexp":
+            # G_ij según González & Santa Cruz (2012), Apéndice II — fracción de dosis
+            Gf = lea_catcheside_biexp_vec(theta, p.t0f_s, p.t0s_s, 1.0, 0.0)
+            Gs = lea_catcheside_biexp_vec(theta, p.t0f_s, p.t0s_s, 0.0, 1.0)
+            ph, pl = p.pf_highLET, p.pf_lowLET
+            for Di, Dj, bi, bj, pf_i, pf_j in [
+                (dB, dF, bB,  bFn, ph, ph),
+                (dB, dT, bB,  bTh, ph, ph),
+                (dB, dG, bB,  bG,  ph, pl),
+                (dF, dT, bFn, bTh, ph, ph),
+                (dF, dG, bFn, bG,  ph, pl),
+                (dT, dG, bTh, bG,  ph, pl),
+            ]:
+                Gij = _Gij_cross(Di, Dj, pf_i, pf_j, Gf, Gs)
+                C += 2.0 * Gij * sqrt(max(bi, 0.0)) * sqrt(max(bj, 0.0)) * Di * Dj
+        else:
+            for Di, Dj, bi, bj, ni, nj in [
+                (dB, dF, bB,  bFn, "Boro",  "Fstn"),
+                (dB, dT, bB,  bTh, "Boro",  "Thn"),
+                (dB, dG, bB,  bG,  "Boro",  "Gamma"),
+                (dF, dT, bFn, bTh, "Fstn",  "Thn"),
+                (dF, dG, bFn, bG,  "Fstn",  "Gamma"),
+                (dT, dG, bTh, bG,  "Thn",   "Gamma"),
+            ]:
+                ai, aj = pair_weights(Di, Dj, bi, bj, scheme)
+                Gij = ai*Gi[ni] + aj*Gi[nj]
+                C += 2.0 * Gij * sqrt(max(bi, 0.0)) * sqrt(max(bj, 0.0)) * Di * Dj
         return C
 
     return Cmix_vec
 
 
-def _make_isoe_inv(p: IsoEParams):
+def _make_isoe_inv(p: IsoEParams, t0_map: dict | None = None):
     """
     Retorna isoe_inv(Cmix) → ndarray
-    Resuelve α_R A + G_R β_R A² = Cmix. G_R = p.GR (escalar FIJO).
+    Resuelve α_R A + G_R β_R A² = Cmix.
+
+    G_R se resuelve via _resolve_GR(p, t0_map):
+        GR_mode="fixed"    → usa p.GR directamente (legacy)
+        GR_mode="computed" → calcula G_R con la cinética lowLET
+                             evaluada en p.t_ref_s (tiempo de referencia).
     """
-    aR = p.aR; bR = max(p.bR, 0.0); GR = p.GR
+    if t0_map is None:
+        t0_map = dict(DEFAULT_T0_MAP)
+    aR = p.aR
+    bR = max(p.bR, 0.0)
+    GR = _resolve_GR(p, t0_map)   # escalar — fijo o calculado
 
     def isoe_inv(Cmix):
         if GR * bR > 0.0:
@@ -818,20 +1205,36 @@ def compute_isoe_from_report(
         # C_quad: términos cuadráticos (diagonal + cruzados)
         C_quad = (Gi["Boro"]*bB*Db*Db + Gi["Fstn"]*bFn*Df*Df +
                   Gi["Thn"]*bTh*Dt*Dt + Gi["Gamma"]*bG*Dg*Dg)
-        for Di, Dj, bi, bj, ni, nj in [
-            (Db, Df, bB,  bFn, "Boro",  "Fstn"),
-            (Db, Dt, bB,  bTh, "Boro",  "Thn"),
-            (Db, Dg, bB,  bG,  "Boro",  "Gamma"),
-            (Df, Dt, bFn, bTh, "Fstn",  "Thn"),
-            (Df, Dg, bFn, bG,  "Fstn",  "Gamma"),
-            (Dt, Dg, bTh, bG,  "Thn",   "Gamma"),
-        ]:
-            ai, aj = pair_weights(Di, Dj, bi, bj, weight_scheme)
-            Gij = ai*Gi[ni] + aj*Gi[nj]
-            C_quad += 2.0 * Gij * sqrt(max(bi, 0.0)) * sqrt(max(bj, 0.0)) * Di * Dj
+        if p.repair_model == "biexp":
+            # G_ij según González & Santa Cruz (2012), Apéndice II — fracción de dosis
+            Gf_s = lea_catcheside_biexp(theta, p.t0f_s, p.t0s_s, 1.0, 0.0)
+            Gs_s = lea_catcheside_biexp(theta, p.t0f_s, p.t0s_s, 0.0, 1.0)
+            ph, pl = p.pf_highLET, p.pf_lowLET
+            for Di, Dj, bi, bj, pf_i, pf_j in [
+                (Db, Df, bB,  bFn, ph, ph),
+                (Db, Dt, bB,  bTh, ph, ph),
+                (Db, Dg, bB,  bG,  ph, pl),
+                (Df, Dt, bFn, bTh, ph, ph),
+                (Df, Dg, bFn, bG,  ph, pl),
+                (Dt, Dg, bTh, bG,  ph, pl),
+            ]:
+                Gij = _Gij_cross(Di, Dj, pf_i, pf_j, Gf_s, Gs_s)
+                C_quad += 2.0 * Gij * sqrt(max(bi, 0.0)) * sqrt(max(bj, 0.0)) * Di * Dj
+        else:
+            for Di, Dj, bi, bj, ni, nj in [
+                (Db, Df, bB,  bFn, "Boro",  "Fstn"),
+                (Db, Dt, bB,  bTh, "Boro",  "Thn"),
+                (Db, Dg, bB,  bG,  "Boro",  "Gamma"),
+                (Df, Dt, bFn, bTh, "Fstn",  "Thn"),
+                (Df, Dg, bFn, bG,  "Fstn",  "Gamma"),
+                (Dt, Dg, bTh, bG,  "Thn",   "Gamma"),
+            ]:
+                ai, aj = pair_weights(Di, Dj, bi, bj, weight_scheme)
+                Gij = ai*Gi[ni] + aj*Gi[nj]
+                C_quad += 2.0 * Gij * sqrt(max(bi, 0.0)) * sqrt(max(bj, 0.0)) * Di * Dj
 
         C = C_lin + C_quad
-        A = _make_isoe_inv(p)(C)
+        A = _make_isoe_inv(p, t0_map)(C)
 
         # Propagación de incerteza:
         # σ_A/A ≈ eps_rel_A donde:
@@ -866,8 +1269,11 @@ def compute_isoe_from_report(
             "organ_presets_used": presets_used,
             "per_organ_params":   params_by_organ is not None,
             "GR_note": (
-                "G_R es escalar fijo del experimento de referencia fotónica "
-                "(NO depende del tiempo de irradiación BNCT θ)."
+                "G_R: modo usado por órgano. "
+                "'fixed': valor de p.GR ingresado por el usuario. "
+                "'computed': calculado como G(t_ref_s, cinética lowLET) "
+                "del tejido — reproduce BNCTar/González 2012. "
+                "En ningún caso depende del tiempo de irradiación BNCT θ."
             ),
         },
     }
@@ -950,10 +1356,11 @@ def solve_time_isoe_from_constraints(
             continue
 
         cv   = _make_cmix_vec(p, t0_map, weight_scheme)
-        inv  = _make_isoe_inv(p)
+        inv  = _make_isoe_inv(p, t0_map)
         aR_  = p.aR
         bR_  = max(p.bR, 0.0)
-        GR_  = p.GR
+        #cambio para incluir calculo con g computed en vez de fijo
+        GR_  = _resolve_GR(p, t0_map)
 
         def _C_R(A): return aR_*A + GR_*bR_*A*A
 

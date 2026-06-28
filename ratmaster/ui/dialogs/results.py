@@ -149,7 +149,7 @@ class MeshSegViewerDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle("Verificación de Alineación SEG ↔ Mesh — RatMaster")
         self.resize(980, 600)
-        self.setMinimumSize(720, 580)
+        # self.setMinimumSize(720, 580)
 
         self.segM           = segM
         self.meshes         = meshes
