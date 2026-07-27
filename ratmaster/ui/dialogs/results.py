@@ -25,11 +25,12 @@ import tempfile
 import numpy as np
 from matplotlib.figure import Figure          # para renderizar DVH offline en el PDF
 from matplotlib.backends.backend_agg import FigureCanvasAgg  # backend sin pantalla
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT  # zoom/pan en el DVH interactivo
 from PySide6 import QtCore, QtWidgets, QtGui
 
 from ratmaster.constants import ORG_ORDER, ORGAN_COLORS, _resolve_boro_protocol_name
 from ratmaster.physics.dose_utils import build_dvh, dvh_extend_to_zero, achieved_value_for_constraint
-from ratmaster.ui.formatters import format_value_uncertainty, format_scientific_value_uncertainty, dose_axis_unit
+from ratmaster.ui.formatters import format_value_uncertainty, format_scientific_value_uncertainty, format_value_uncertainty_separate, format_time, dose_axis_unit, format_boro_origin
 from ratmaster.ui.canvas import MplCanvas
 
 try:
@@ -1194,8 +1195,9 @@ class CalculationParamsDialog(QtWidgets.QDialog):
             ("Modo", modo_str),
             ("Protocolo de boro", _resolve_boro_protocol_name(
                 meta.get("boro_protocol_name", "Manual"))),
+            ("Origen del boro", format_boro_origin(meta)),
             ("Tiempo de irradiación",
-             format_value_uncertainty(t, t_err, "s")),
+             format_time(t, t_err, "s")),
             ("Flujo neutrónico (SPND)",
              format_scientific_value_uncertainty(spnd, spnd_err, "n/cm²·s")),
         ]
@@ -1539,7 +1541,8 @@ class ResultsDialog(QtWidgets.QDialog):
                  isoe_params_by_organ=None):
         super().__init__(parent)
         self.setWindowTitle("Resultados")
-        self.resize(1000, 620)
+        self.resize(1280, 600)
+        self.setMinimumSize(720, 480)
         self.report = report
         self.dsum = dsum_selected
         self.deq = deq
@@ -1556,68 +1559,157 @@ class ResultsDialog(QtWidgets.QDialog):
 
         # encabezado
         meta = report.get("meta", {})
+        self._meta = meta   # guardado para re-formatear tiempo si cambia el modo
+        self._unit = unit
+        self._time_fmt = "s"   # "s" o "ms" — controlado por el combo de abajo
+
         hdr = QtWidgets.QLabel()
-        s = f"<b>Tipo de cálculo:</b> {dose_mode_text} &nbsp;&nbsp; "
-        s += f"<b>Tiempo:</b> {format_value_uncertainty(meta.get('time',0), meta.get('time_err',0), 's')}"
-        if meta.get("mode","time") == "constraints":
-            ch = meta.get("chosen_constraint")
-            if ch:
-                ach = ch.get('achieved_value', 0.0)
-                s += f" &nbsp;&nbsp; <b>Restricción limitante:</b> {ch.get('org','?')} - {ch.get('type','?')} (límite {ch.get('limit_value','?')} {unit}, logrado {float(ach):.3f} {unit})"
-        hdr.setText(s)
+        hdr.setTextFormat(QtCore.Qt.RichText)
+        self._hdr = hdr   # guardado para actualizar al cambiar formato de tiempo
+
+        def _build_hdr():
+            t   = meta.get("time", 0)
+            t_e = meta.get("time_err", 0)
+            s = f"<b>Tipo de cálculo:</b> {dose_mode_text} &nbsp;&nbsp; "
+            s += f"<b>Tiempo:</b> {format_time(t, t_e, self._time_fmt)}"
+            if meta.get("mode", "time") == "constraints":
+                ch = meta.get("chosen_constraint")
+                if ch:
+                    ach = ch.get("achieved_value", 0.0)
+                    s += (f" &nbsp;&nbsp; <b>Restricción limitante:</b> "
+                          f"{ch.get('org','?')} - {ch.get('type','?')} "
+                          f"(límite {ch.get('limit_value','?')} {unit}, "
+                          f"logrado {float(ach):.3f} {unit})")
+            return s
+
+        self._build_hdr = _build_hdr
+        hdr.setText(_build_hdr())
         layout.addWidget(hdr)
 
         # parámetros (valores seleccionables con el mouse)
         pbox = QtWidgets.QGroupBox("Parámetros")
         form = QtWidgets.QFormLayout(pbox)
-        form.addRow("Protocolo de boro:", _selectable_label(_resolve_boro_protocol_name(meta.get("boro_protocol_name", "Manual"))))
-        form.addRow("Flujo neutrónico (n/cm\u00b2·s):", _selectable_label(format_scientific_value_uncertainty(meta.get("spnd",0), meta.get("spnd_abs_err",0), "n/cm²·s")))
-        form.addRow("Tiempo:", _selectable_label(format_value_uncertainty(meta.get("time",0), meta.get("time_err",0), "s")))
+        form.addRow("Protocolo de boro:",
+                    _selectable_label(_resolve_boro_protocol_name(meta.get("boro_protocol_name", "Manual"))))
+        form.addRow("Origen del boro:",
+                    _selectable_label(format_boro_origin(meta)))
+        form.addRow("Flujo neutrónico (n/cm\u00b2·s):",
+                    _selectable_label(format_scientific_value_uncertainty(
+                        meta.get("spnd", 0), meta.get("spnd_abs_err", 0), "n/cm²·s")))
+
+        # Tiempo con selector de formato (segundos / minutos+segundos)
+        self._lbl_tiempo = _selectable_label(
+            format_time(meta.get("time", 0), meta.get("time_err", 0), self._time_fmt))
+        cmb_time_fmt = QtWidgets.QComboBox()
+        cmb_time_fmt.addItem("en segundos", "s")
+        cmb_time_fmt.addItem("en min + seg", "ms")
+        cmb_time_fmt.setFixedWidth(120)
+        time_row = QtWidgets.QHBoxLayout()
+        time_row.addWidget(self._lbl_tiempo)
+        time_row.addStretch()
+        time_row.addWidget(QtWidgets.QLabel("Mostrar"))
+        time_row.addWidget(cmb_time_fmt)
+        time_widget = QtWidgets.QWidget()
+        time_widget.setLayout(time_row)
+        form.addRow("Tiempo:", time_widget)
+
+        def _on_time_fmt_changed():
+            self._time_fmt = cmb_time_fmt.currentData()
+            t   = meta.get("time", 0)
+            t_e = meta.get("time_err", 0)
+            self._lbl_tiempo.setText(format_time(t, t_e, self._time_fmt))
+            self._hdr.setText(self._build_hdr())
+
+        cmb_time_fmt.currentIndexChanged.connect(_on_time_fmt_changed)
         layout.addWidget(pbox)
 
-        # tabla de resultados (según modo)
-        table = QtWidgets.QTableWidget()
-        table.setAlternatingRowColors(True)
-        table.setShowGrid(True)
-        table.verticalHeader().setVisible(False)
-        keys = sorted(self.dsum.keys())
-        # Columnas: Órgano | Dosis Promedio ± | Dosis Mínima ± | Dosis Máxima ± | D95 ± | D5 ±
-        cols = ["Órgano", "Dosis Promedio", "±", "Dosis Mínima", "±", "Dosis Máxima", "±", "D95", "±", "D5", "±"]
-        table.setColumnCount(len(cols))
-        table.setRowCount(len(keys))
-        table.setHorizontalHeaderLabels(cols)
-        for i,k in enumerate(keys):
-            v = self.dsum[k]
-            def it(v): 
-                item = QtWidgets.QTableWidgetItem(v)
-                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
-                return item
-            table.setItem(i,0, it(k))
-            # Orden: Promedio, Mínima, Máxima, D95, D5
-            table.setItem(i,1, it(f"{v['Dmean']:.2f}"))
-            table.setItem(i,2, it(f"{v['Sigma_Dmean']:.2f}"))
-            table.setItem(i,3, it(f"{v['Dmin']:.2f}"))
-            table.setItem(i,4, it(f"{v['Sigma_Dmin']:.2f}"))
-            table.setItem(i,5, it(f"{v['Dmax']:.2f}"))
-            table.setItem(i,6, it(f"{v['Sigma_Dmax']:.2f}"))
-            table.setItem(i,7, it(f"{v['D95']:.2f}"))
-            table.setItem(i,8, it(f"{v['Sigma_D95']:.2f}"))
-            table.setItem(i,9, it(f"{v['D5']:.2f}"))
-            table.setItem(i,10,it(f"{v['Sigma_D5']:.2f}"))
-        table.resizeColumnsToContents()
-        _install_copy_shortcut(table)
-        layout.addWidget(table)
+        # ── Tabla de métricas (panel izquierdo) ──────────────────────────────
+        # Voxmap para calcular métricas adicionales (Dx%) — guardado como
+        # atributo para usarlo al togglear la columna extra al maximizar.
+        self._voxmap_for_metric = self.report.get(
+            "IsoVoxel" if self.is_isoe else ("BioVoxel" if self.use_bio else "PhysVoxel"), {}
+        )
 
-        # DVH en este diálogo
-        self.canvas = MplCanvas(self, width=6, height=3.5)
+        # Columnas base (siempre visibles): Órgano | Promedio ± | Mínima ± | Máxima ±
+        # Columnas extendidas (solo al maximizar): D95 ± | D5 ± | Dx% (col extra)
+        self._cols_base     = ["Órgano", "Dosis Promedio", "±", "Dosis Mínima", "±", "Dosis Máxima", "±"]
+        self._cols_extended = ["D95", "±", "D5", "±"]
+        self._col_dx_label  = "D10%"   # encabezado dinámico de la columna extra
+
+        self.table = QtWidgets.QTableWidget()
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(True)
+        self.table.verticalHeader().setVisible(False)
+        keys = sorted(self.dsum.keys())
+        self._table_keys = keys
+        self.table.setRowCount(len(keys))
+        self._build_table_columns(extended=False)
+
+        _install_copy_shortcut(self.table)
+
+        # Spinbox para la columna Dx% (visible solo cuando la tabla está maximizada)
+        self.spin_pct = QtWidgets.QSpinBox()
+        self.spin_pct.setRange(1, 99)
+        self.spin_pct.setValue(10)
+        self.spin_pct.setSuffix(" %")
+        self.spin_pct.setToolTip("Porcentaje de volumen — D10% = dosis que recibe el 10% más caliente del volumen")
+        self.spin_pct.valueChanged.connect(self._refresh_dx_column)
+        self._spin_pct_widget = QtWidgets.QWidget()
+        spin_row = QtWidgets.QHBoxLayout(self._spin_pct_widget)
+        spin_row.setContentsMargins(0, 0, 0, 0)
+        spin_row.addWidget(QtWidgets.QLabel("Mostrar columna D"))
+        spin_row.addWidget(self.spin_pct)
+        spin_row.addWidget(QtWidgets.QLabel("del vol."))
+        spin_row.addStretch()
+        self._spin_pct_widget.setVisible(False)  # oculto hasta que se maximice la tabla
+
+        table_panel = QtWidgets.QWidget()
+        table_panel_layout = QtWidgets.QVBoxLayout(table_panel)
+        table_panel_layout.setContentsMargins(0, 0, 0, 0)
+        table_header = QtWidgets.QHBoxLayout()
+        lbl_metrics_title = QtWidgets.QLabel("<b>Métricas dosimétricas</b>")
+        lbl_metrics_title.setAlignment(QtCore.Qt.AlignCenter)
+        table_header.addStretch()
+        table_header.addWidget(lbl_metrics_title)
+        table_header.addStretch()
+        self.btn_max_table = QtWidgets.QToolButton()
+        self.btn_max_table.setText("Maximizar ↔")
+        self.btn_max_table.setCheckable(True)
+        self.btn_max_table.setToolTip("Expande la tabla y oculta temporalmente el gráfico")
+        table_header.addWidget(self.btn_max_table)
+        table_panel_layout.addLayout(table_header)
+        table_panel_layout.addWidget(self.table, 1)         # stretch=1: tabla ocupa todo el espacio vertical
+        table_panel_layout.addWidget(self._spin_pct_widget) # fijo abajo, solo visible al maximizar
+
+        # ── DVH (panel derecho) ───────────────────────────────────────────────
+        dvh_panel = QtWidgets.QWidget()
+        dvh_panel_layout = QtWidgets.QVBoxLayout(dvh_panel)
+        dvh_panel_layout.setContentsMargins(0, 0, 0, 0)
+        dvh_header = QtWidgets.QHBoxLayout()
+        lbl_dvh_title = QtWidgets.QLabel("<b>Histograma dosis-volumen (DVH)</b>")
+        lbl_dvh_title.setAlignment(QtCore.Qt.AlignCenter)
+        dvh_header.addStretch()
+        dvh_header.addWidget(lbl_dvh_title)
+        dvh_header.addStretch()
+        self.btn_max_dvh = QtWidgets.QToolButton()
+        self.btn_max_dvh.setText("Maximizar ↔")
+        self.btn_max_dvh.setCheckable(True)
+        self.btn_max_dvh.setToolTip("Expande el gráfico y oculta temporalmente la tabla")
+        dvh_header.addWidget(self.btn_max_dvh)
+        dvh_panel_layout.addLayout(dvh_header)
+
+        self.canvas = MplCanvas(self, width=6, height=4.5)
+        self.dvh_toolbar = NavigationToolbar2QT(self.canvas, self)
+        dvh_panel_layout.addWidget(self.dvh_toolbar)
+
         self.canvas.ax.clear()
         xlab = f"Dosis ({dose_axis_unit(self.use_bio, self.is_isoe)})"
-        title = "DVH — Dosis Isoefectiva (Photon IsoE)" if self.is_isoe else ("DVH — Dosis Equivalente pesada por RBE" if self.use_bio else "DVH — Dosis Física")
+        title = "DVH — Dosis Isoefectiva (Photon IsoE)" if self.is_isoe else (
+                "DVH — Dosis Equivalente pesada por RBE" if self.use_bio else "DVH — Dosis Física")
         self.canvas.ax.set_xlabel(xlab)
         self.canvas.ax.set_ylabel("Volumen (%)")
         self.canvas.ax.set_title(title)
-        voxmap = self.report.get("IsoVoxel" if self.is_isoe else ("BioVoxel" if self.use_bio else "PhysVoxel"), {})
-        # Usar colores fijos por órgano (mismo orden que ORGAN_COLORS en constants)
+        voxmap = self._voxmap_for_metric
         _keys = list(voxmap.keys())
         _color_map = {k: ORGAN_COLORS[i % len(ORGAN_COLORS)] for i, k in enumerate(_keys)}
         for key, vox in voxmap.items():
@@ -1626,7 +1718,7 @@ class ResultsDialog(QtWidgets.QDialog):
             s, vol = build_dvh(arr)
             s, vol = dvh_extend_to_zero(s, vol)
             if s.size > 0:
-                self.canvas.ax.plot(s, vol, label=key, color=_color_map[key])
+                self.canvas.ax.plot(s, vol, label=key, color=_color_map[key], picker=5)
         self.canvas.ax.set_xlim(left=0)
         self.canvas.ax.set_ylim(0, 105)
         self.canvas.ax.grid(True, which='major', color='#E0E0E0', linewidth=0.8, alpha=0.9)
@@ -1634,8 +1726,30 @@ class ResultsDialog(QtWidgets.QDialog):
         self.canvas.ax.minorticks_on()
         self.canvas.ax.set_axisbelow(True)
         self.canvas.ax.legend(loc="best", fontsize=8, framealpha=0.85, edgecolor='#CCCCCC')
-        self.canvas.fig.tight_layout(pad=1.5); self.canvas.draw()
-        layout.addWidget(self.canvas)
+        self.canvas.fig.tight_layout(pad=1.5)
+        self.canvas.draw()
+        dvh_panel_layout.addWidget(self.canvas, 1)   # stretch=1 para que ocupe todo el espacio vertical
+
+        # Label de coordenadas — compacto, sin texto explicativo para no robar espacio
+        self.lbl_coords = QtWidgets.QLabel("")
+        self.lbl_coords.setStyleSheet("color: #546E7A; font-size: 11px;")
+        self.lbl_coords.setFixedHeight(16)
+        dvh_panel_layout.addWidget(self.lbl_coords)
+        self.canvas.mpl_connect("button_press_event", self._on_dvh_click)
+
+        # ── Splitter: tabla a la izquierda, DVH a la derecha ─────────────────
+        self.results_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.results_splitter.addWidget(table_panel)
+        self.results_splitter.addWidget(dvh_panel)
+        self.results_splitter.setStretchFactor(0, 1)
+        self.results_splitter.setStretchFactor(1, 1)
+        self.results_splitter.setSizes([1, 1])
+        layout.addWidget(self.results_splitter, 1)
+
+        self._table_panel = table_panel
+        self._dvh_panel = dvh_panel
+        self.btn_max_table.toggled.connect(self._on_toggle_max_table)
+        self.btn_max_dvh.toggled.connect(self._on_toggle_max_dvh)
 
         # botones
         h = QtWidgets.QHBoxLayout()
@@ -1707,6 +1821,132 @@ class ResultsDialog(QtWidgets.QDialog):
         self.btn_params.clicked.connect(self._open_calc_params)
         self.btn_viz.clicked.connect(self._open_dose_viewer)
         self.btn_radiobio.clicked.connect(self._open_radiobio_dialog)
+
+    # ── helpers de tabla ──────────────────────────────────────────────────────
+
+    def _build_table_columns(self, extended: bool):
+        """
+        Construye (o reconstruye) las columnas de la tabla de métricas.
+
+        extended=False → columnas base: Órgano | Promedio ± | Mínima ± | Máxima ±
+        extended=True  → columnas base + D95 ± | D5 ± | Dx% (columna extra dinámica)
+
+        Se puede llamar varias veces — resetea el contenido y vuelve a llenarlo.
+        """
+        def it(txt):
+            item = QtWidgets.QTableWidgetItem(str(txt))
+            item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+            return item
+
+        pct = self.spin_pct.value() if hasattr(self, "spin_pct") else 10
+        dx_label = f"D{pct}%"
+
+        if extended:
+            cols = self._cols_base + self._cols_extended + [dx_label]
+        else:
+            cols = self._cols_base
+
+        self.table.setColumnCount(len(cols))
+        self.table.setHorizontalHeaderLabels(cols)
+
+        for i, k in enumerate(self._table_keys):
+            v = self.dsum[k]
+            dmean_v, dmean_s = format_value_uncertainty_separate(v["Dmean"], v["Sigma_Dmean"])
+            dmin_v,  dmin_s  = format_value_uncertainty_separate(v["Dmin"],  v["Sigma_Dmin"])
+            dmax_v,  dmax_s  = format_value_uncertainty_separate(v["Dmax"],  v["Sigma_Dmax"])
+
+            self.table.setItem(i, 0, it(k))
+            self.table.setItem(i, 1, it(dmean_v))
+            self.table.setItem(i, 2, it(dmean_s))
+            self.table.setItem(i, 3, it(dmin_v))
+            self.table.setItem(i, 4, it(dmin_s))
+            self.table.setItem(i, 5, it(dmax_v))
+            self.table.setItem(i, 6, it(dmax_s))
+
+            if extended:
+                d95_v, d95_s = format_value_uncertainty_separate(v["D95"], v["Sigma_D95"])
+                d5_v,  d5_s  = format_value_uncertainty_separate(v["D5"],  v["Sigma_D5"])
+                self.table.setItem(i, 7, it(d95_v))
+                self.table.setItem(i, 8, it(d95_s))
+                self.table.setItem(i, 9, it(d5_v))
+                self.table.setItem(i, 10, it(d5_s))
+                # Columna Dx%
+                dx_val = achieved_value_for_constraint(self._voxmap_for_metric, k, f"D{pct}%")
+                unit = dose_axis_unit(self.use_bio, self.is_isoe)
+                self.table.setItem(i, 11, it(f"{dx_val:.2f} {unit}" if dx_val is not None else "—"))
+
+        self.table.resizeColumnsToContents()
+
+    def _refresh_dx_column(self):
+        """
+        Actualiza el encabezado y los valores de la columna Dx% cuando
+        cambia el spinbox — solo cuando la tabla está en modo extendido.
+        """
+        if not self.btn_max_table.isChecked():
+            return
+        pct = self.spin_pct.value()
+        dx_label = f"D{pct}%"
+        ncols = self.table.columnCount()
+        dx_col = ncols - 1   # siempre la última columna
+        self.table.setHorizontalHeaderItem(dx_col, QtWidgets.QTableWidgetItem(dx_label))
+        unit = dose_axis_unit(self.use_bio, self.is_isoe)
+        for i, k in enumerate(self._table_keys):
+            dx_val = achieved_value_for_constraint(self._voxmap_for_metric, k, f"D{pct}%")
+            item = QtWidgets.QTableWidgetItem(f"{dx_val:.2f} {unit}" if dx_val is not None else "—")
+            item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.table.setItem(i, dx_col, item)
+        self.table.resizeColumnToContents(dx_col)
+
+    # ── DVH: click con coordenadas ────────────────────────────────────────────
+
+    def _on_dvh_click(self, event):
+        """Muestra las coordenadas (dosis, volumen%) del punto donde se hizo click."""
+        if event.inaxes != self.canvas.ax or event.xdata is None or event.ydata is None:
+            return
+        unit = dose_axis_unit(self.use_bio, self.is_isoe)
+        self.lbl_coords.setText(
+            f"Dosis: {event.xdata:.2f} {unit}   |   Volumen: {event.ydata:.1f} %"
+        )
+
+    # ── toggles de maximizar ──────────────────────────────────────────────────
+
+    def _on_toggle_max_table(self, checked: bool):
+        """
+        Maximiza la tabla (oculta el DVH) o restaura el 50/50.
+        Al maximizar: muestra columnas extendidas (D95, D5, Dx%) y el spinbox.
+        Al restaurar: vuelve a columnas base y oculta el spinbox.
+        Texto del botón cambia entre "Maximizar ↔" y "Restaurar ↔".
+        """
+        if checked:
+            self.btn_max_table.setText("Restaurar ↔")
+            self.btn_max_dvh.setChecked(False)
+            self._dvh_panel.setVisible(False)
+            total = sum(self.results_splitter.sizes()) or self.results_splitter.width()
+            self.results_splitter.setSizes([total, 0])
+            self._build_table_columns(extended=True)
+            self._spin_pct_widget.setVisible(True)
+        else:
+            self.btn_max_table.setText("Maximizar ↔")
+            self._dvh_panel.setVisible(True)
+            self.results_splitter.setSizes([1, 1])
+            self._build_table_columns(extended=False)
+            self._spin_pct_widget.setVisible(False)
+
+    def _on_toggle_max_dvh(self, checked: bool):
+        """
+        Maximiza el DVH (oculta la tabla) o restaura el 50/50.
+        Texto del botón cambia entre "Maximizar ↔" y "Restaurar ↔".
+        """
+        if checked:
+            self.btn_max_dvh.setText("Restaurar ↔")
+            self.btn_max_table.setChecked(False)
+            self._table_panel.setVisible(False)
+            total = sum(self.results_splitter.sizes()) or self.results_splitter.width()
+            self.results_splitter.setSizes([0, total])
+        else:
+            self.btn_max_dvh.setText("Maximizar ↔")
+            self._table_panel.setVisible(True)
+            self.results_splitter.setSizes([1, 1])
 
     def _open_radiobio_dialog(self):
         """Abre RadiobioDialog para análisis TCP/NTCP y supervivencia."""
@@ -1871,7 +2111,8 @@ class ResultsDialog(QtWidgets.QDialog):
             ("Tipo de dosis",             self.dose_mode_text),
             ("Modo de cálculo",           modo_str),
             ("Protocolo de boro",         _resolve_boro_protocol_name(meta.get("boro_protocol_name", "Manual"))),
-            ("Tiempo de irradiación",     format_value_uncertainty(meta.get("time", 0), meta.get("time_err", 0), "s")),
+            ("Origen del boro",           format_boro_origin(meta)),
+            ("Tiempo de irradiación",     format_time(meta.get("time", 0), meta.get("time_err", 0), "s")),
             ("Flujo neutrónico (n/cm²·s)",format_scientific_value_uncertainty(meta.get("spnd", 0), meta.get("spnd_abs_err", 0), "n/cm²·s")),
         ]
 
@@ -2078,7 +2319,8 @@ class ResultsDialog(QtWidgets.QDialog):
             ["Modo", "Restricciones" if meta.get("mode")=="constraints" else "Tiempo fijo"],
             ["Tipo de dosis", self.dose_mode_text],
             ["Protocolo de boro", _resolve_boro_protocol_name(meta.get("boro_protocol_name", "Manual"))],
-            ["Tiempo", format_value_uncertainty(meta.get("time",0), meta.get("time_err",0), "s")],
+            ["Origen del boro", format_boro_origin(meta)],
+            ["Tiempo", format_time(meta.get("time",0), meta.get("time_err",0), "s")],
             ["Flujo neutrónico", format_scientific_value_uncertainty(meta.get("spnd",0), meta.get("spnd_abs_err",0), "n/cm²·s")],
         ]
         if meta.get("mode")=="constraints" and meta.get("chosen_constraint"):
@@ -2255,13 +2497,17 @@ class ResultsDialog(QtWidgets.QDialog):
         data_metrics = [["Órgano", "Dosis Promedio ± σ", "Dosis Mínima ± σ", "Dosis Máxima ± σ", "D95 ± σ", "D5 ± σ"]]
         for key in sorted(self.dsum.keys()):
             v = self.dsum[key]
+            # [FIX] Antes: f"{v['Dmean']:.2f} ± {v['Sigma_Dmean']:.2f}" con
+            # decimales fijos sin relación con la cifra significativa real
+            # de cada sigma. Ahora usa la misma regla de redondeo que el
+            # resto de la app (ver ui/formatters.format_value_uncertainty).
             row = [
                 key,
-                f"{v['Dmean']:.2f} ± {v['Sigma_Dmean']:.2f}",
-                f"{v['Dmin']:.2f} ± {v['Sigma_Dmin']:.2f}",
-                f"{v['Dmax']:.2f} ± {v['Sigma_Dmax']:.2f}",
-                f"{v['D95']:.2f} ± {v['Sigma_D95']:.2f}",
-                f"{v['D5']:.2f} ± {v['Sigma_D5']:.2f}",
+                format_value_uncertainty(v['Dmean'], v['Sigma_Dmean']),
+                format_value_uncertainty(v['Dmin'],  v['Sigma_Dmin']),
+                format_value_uncertainty(v['Dmax'],  v['Sigma_Dmax']),
+                format_value_uncertainty(v['D95'],   v['Sigma_D95']),
+                format_value_uncertainty(v['D5'],    v['Sigma_D5']),
             ]
             data_metrics.append(row)
         cols_metrics = [90, 120, 120, 120, 120, 120]

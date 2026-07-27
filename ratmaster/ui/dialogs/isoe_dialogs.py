@@ -97,7 +97,7 @@ class IsoEOrganParamsDialog(QtWidgets.QDialog):
                  current_assignment: dict | None = None):
         super().__init__(parent)
         self.setWindowTitle("Configurar cálculo de Dosis Isoefectiva por órgano")
-        self.setMinimumSize(900, 500)
+        self.setMinimumSize(700, 420)
         self.resize(960, 640)
         self._organs = list(organ_list)
         self._rows: list[dict] = []
@@ -434,7 +434,7 @@ class IsoEPresetsDialog(QtWidgets.QDialog):
     def __init__(self, parent, current_preset_name: str = "Manual"):
         super().__init__(parent)
         self.setWindowTitle("Biblioteca de presets IsoE (MLQ)")
-        self.setMinimumSize(680, 580)
+        self.setMinimumSize(560, 460)
         self.resize(720, 800)
         self._loading = False
         self._selected = (current_preset_name or "Manual").strip()

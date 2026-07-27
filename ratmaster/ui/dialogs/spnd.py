@@ -134,14 +134,32 @@ class SPNDFromCurrentsDialog(QtWidgets.QDialog):
     def __init__(self, parent=None, snapshot=None):
         super().__init__(parent)
         self.setWindowTitle("SPND — Calcular flujo desde corrientes")
-        self.resize(1020, 620)
+        self.resize(1000, 560)
         self.reg = load_spnd_registry()
 
         self._phi = None
         self._sigphi = None
         self._snapshot = None   # se llena en _recalc y al restaurar
 
-        lay = QtWidgets.QVBoxLayout(self)
+        # Layout externo del diálogo: solo contiene el QScrollArea + el
+        # área de botones (que siempre queda fija y visible abajo, fuera
+        # del scroll).
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QtWidgets.QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+
+        content = QtWidgets.QWidget()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        lay = QtWidgets.QVBoxLayout(content)
+        lay.setContentsMargins(12, 12, 12, 12)
 
         # =========================================================
         # Header: referencia + botones
@@ -152,6 +170,8 @@ class SPNDFromCurrentsDialog(QtWidgets.QDialog):
         self.cmb_ref = QtWidgets.QComboBox()
         det_names = [d["name"] for d in self.reg.get("detectors", [])]
         self.cmb_ref.addItems(det_names)
+        self.cmb_ref.setMaxVisibleItems(8)
+        self.cmb_ref.view().setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
 
         if "Verde (ref)" in det_names:
             self.cmb_ref.setCurrentText("Verde (ref)")
@@ -211,6 +231,25 @@ QTableWidget::indicator:checked {
         self._init_row(2, "A1")
         lay.addWidget(self.tbl)
         self.tbl.resizeColumnsToContents()
+
+        # La tabla solo tiene 3 filas fijas (Rojo, A0, A1): le damos una
+        # altura exacta para que se vean siempre completas sin necesidad
+        # de scrollear dentro de la tabla. Si la ventana es chica, el
+        # scroll general del diálogo se encarga del resto.
+        self.tbl.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.tbl.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
+        )
+
+        def _fit_table_height():
+            h = self.tbl.horizontalHeader().height()
+            for r in range(self.tbl.rowCount()):
+                h += self.tbl.rowHeight(r)
+            h += 2 * self.tbl.frameWidth()
+            self.tbl.setFixedHeight(h)
+
+        self._fit_table_height = _fit_table_height
+        QtCore.QTimer.singleShot(0, _fit_table_height)
 
         # =========================================================
         # CIP
@@ -272,9 +311,11 @@ QTableWidget::indicator:checked {
         lay.addWidget(res)
 
         # =========================================================
-        # Botones
+        # Botones (fijos, fuera del área con scroll)
         # =========================================================
-        btns = QtWidgets.QHBoxLayout()
+        btns_widget = QtWidgets.QWidget()
+        btns = QtWidgets.QHBoxLayout(btns_widget)
+        btns.setContentsMargins(12, 8, 12, 12)
         self.btn_calc = QtWidgets.QPushButton("Calcular")
         self.btn_apply = QtWidgets.QPushButton("Aplicar a RatMaster")
         self.btn_close = QtWidgets.QPushButton("Cerrar")
@@ -283,7 +324,7 @@ QTableWidget::indicator:checked {
         btns.addWidget(self.btn_apply)
         btns.addStretch()
         btns.addWidget(self.btn_close)
-        lay.addLayout(btns)
+        outer.addWidget(btns_widget)
 
         self.btn_apply.setEnabled(False)
 
@@ -426,6 +467,11 @@ QTableWidget::indicator:checked {
         cmb = QtWidgets.QComboBox()
         det_names = [d["name"] for d in self.reg.get("detectors", [])]
         cmb.addItems(det_names)
+        # Evitar que el desplegable (popup) del combo crezca más que el
+        # espacio disponible verticalmente: limitamos cuántos ítems se
+        # muestran antes de que aparezca su propio scroll interno.
+        cmb.setMaxVisibleItems(8)
+        cmb.view().setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
 
         if det_name in det_names:
             cmb.setCurrentText(det_name)
@@ -434,6 +480,15 @@ QTableWidget::indicator:checked {
 
         self.tbl.setCellWidget(r, 1, cmb)
         cmb.currentTextChanged.connect(lambda *_: self._row_update(r))
+
+        # El combo de detector no debe ser más alto que la celda: lo topamos
+        # a una altura fija razonable y agrandamos la fila si hiciera falta,
+        # para que el rectángulo del combo (con su triangulito) quede
+        # totalmente contenido dentro de la fila y no invada la de abajo.
+        cmb.setFixedHeight(24)
+        needed_row_h = cmb.sizeHint().height() + 6
+        if self.tbl.rowHeight(r) < needed_row_h:
+            self.tbl.setRowHeight(r, needed_row_h)
 
         self.tbl.setItem(r, 2, QtWidgets.QTableWidgetItem(""))
         self.tbl.setItem(r, 3, QtWidgets.QTableWidgetItem(""))

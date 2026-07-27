@@ -1,0 +1,42 @@
+{
+  "version": 3,
+  "updated_label": "Actualizados a may 2024",
+  "units": {
+    "current": "pA",
+    "sensitivity": "A/(n/cm^2/s)"
+  },
+  "detectors": [
+    {
+      "name": "Rojo",
+      "factor_to_verde": 1.025416,
+      "sens": 1.9e-21,
+      "sens_sigma": 1.5e-22,
+      "last_calib": "",
+      "notes": ""
+    },
+    {
+      "name": "A0",
+      "factor_to_verde": 0.98599951,
+      "sens": null,
+      "sens_sigma": null,
+      "last_calib": "",
+      "notes": ""
+    },
+    {
+      "name": "A1",
+      "factor_to_verde": 1.00603069,
+      "sens": null,
+      "sens_sigma": null,
+      "last_calib": "",
+      "notes": ""
+    },
+    {
+      "name": "Verde (ref)",
+      "factor_to_verde": 1.0,
+      "sens": 1.98e-21,
+      "sens_sigma": 1.6e-22,
+      "last_calib": "",
+      "notes": ""
+    }
+  ]
+}

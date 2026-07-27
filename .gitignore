@@ -2,3 +2,9 @@
 archivos instalador/
 __pycache__/
 validacion/
+build/
+dist/
+installer_output/
+RatMaster_installer.iss
+ratmaster.spec
+build_ratmaster.bat

@@ -23,44 +23,92 @@ APP_NAME = "RatMaster"
 
 
 # ── Detección de modo empaquetado ────────────────────────────────────────────
+def _frozen_search_dirs() -> list[Path]:
+    """
+    Lista de carpetas donde PyInstaller pudo haber colocado los datos
+    empaquetados, en orden de prioridad.
+    - exe_dir            → ubicación clásica (onedir antiguo, o copias manuales en el .iss)
+    - exe_dir/_internal  → ubicación real en PyInstaller 6+ onedir
+    - _MEIPASS           → solo existe en modo --onefile
+    """
+    exe_dir = Path(sys.executable).parent.resolve()
+    dirs = [exe_dir, exe_dir / "_internal"]
+    if hasattr(sys, "_MEIPASS"):
+        dirs.append(Path(sys._MEIPASS).resolve())
+    return dirs
+
+
+def app_install_dir() -> Path:
+    """
+    Directorio "base" de instalación (se mantiene por compatibilidad,
+    p.ej. para ensure_user_vectors). Devuelve la primera carpeta donde
+    se encuentre 'Vectores'.
+    """
+    if is_frozen_app():
+        for d in _frozen_search_dirs():
+            if (d / "Vectores").exists():
+                return d
+        return Path(sys.executable).parent.resolve()
+
+    return Path(__file__).parent.parent.resolve()
+
+
+def bundled_resource_path(*parts) -> Path:
+    """
+    Ruta a un recurso empaquetado. Busca en TODAS las ubicaciones posibles
+    (exe_dir, exe_dir/_internal, _MEIPASS) en vez de asumir una sola base,
+    porque distintos datos pueden terminar en distintos lugares según
+    cómo se armó el instalador o el .spec.
+    """
+    if is_frozen_app():
+        for d in _frozen_search_dirs():
+            candidate = d.joinpath(*parts)
+            if candidate.exists():
+                return candidate
+        # No se encontró: devolver la ruta "esperada" para que el error,
+        # si lo hay, sea más claro al loguearlo.
+        return Path(sys.executable).parent.joinpath(*parts)
+
+    return app_install_dir().joinpath(*parts)
+
 
 def is_frozen_app() -> bool:
     """Devuelve True si la app se está ejecutando empaquetada con PyInstaller."""
     return getattr(sys, "frozen", False)
 
 
-def app_install_dir() -> Path:
-    """
-    Directorio de instalación de la aplicación.
-    - Empaquetado: carpeta que contiene el .exe (donde también está 'Vectores/').
-    - Desarrollo:  carpeta que contiene este archivo .py.
-    """
-    if is_frozen_app():
-        exe_dir = Path(sys.executable).parent.resolve()
-
-        # Caso estándar: Vectores está junto al .exe
-        if (exe_dir / "Vectores").exists():
-            return exe_dir
-
-        # Fallback: dentro de _MEIPASS (bundle onefile)
-        if hasattr(sys, "_MEIPASS"):
-            meipass = Path(sys._MEIPASS).resolve()
-            if (meipass / "Vectores").exists():
-                return meipass
-
-        return exe_dir  # último recurso
-
-    # Modo desarrollo: la raíz del proyecto es el PADRE de la carpeta ratmaster/.
-    # app_paths.py vive en ratmaster/app_paths.py, así que:
-    #   Path(__file__).parent   → ratmaster/
-    #   .parent                 → raíz/  (donde están Vectores/, RatMaster.py, bnct_union.py)
-    root = Path(__file__).parent.parent.resolve()
-
-    # Doble verificación: si Vectores/ existe en la raíz confirmada, la usamos.
-    # Si no (p.ej. alguien copió solo la subcarpeta), devolvemos igual la raíz
-    # para que el error de "no se encontró Vectores" sea claro.
-    return root
-
+#def app_install_dir() -> Path:
+#    """
+#    Directorio de instalación de la aplicación.
+#    - Empaquetado: carpeta que contiene el .exe (donde también está 'Vectores/').
+#    - Desarrollo:  carpeta que contiene este archivo .py.
+#    """
+#    if is_frozen_app():
+#        exe_dir = Path(sys.executable).parent.resolve()
+#
+#        # Caso estándar: Vectores está junto al .exe
+#        if (exe_dir / "Vectores").exists():
+#            return exe_dir
+#
+#        # Fallback: dentro de _MEIPASS (bundle onefile)
+#        if hasattr(sys, "_MEIPASS"):
+#            meipass = Path(sys._MEIPASS).resolve()
+#            if (meipass / "Vectores").exists():
+#                return meipass
+#
+#        return exe_dir  # último recurso
+#
+#    # Modo desarrollo: la raíz del proyecto es el PADRE de la carpeta ratmaster/.
+#    # app_paths.py vive en ratmaster/app_paths.py, así que:
+#    #   Path(__file__).parent   → ratmaster/
+#    #   .parent                 → raíz/  (donde están Vectores/, RatMaster.py, bnct_union.py)
+#    root = Path(__file__).parent.parent.resolve()
+#
+#    # Doble verificación: si Vectores/ existe en la raíz confirmada, la usamos.
+#    # Si no (p.ej. alguien copió solo la subcarpeta), devolvemos igual la raíz
+#    # para que el error de "no se encontró Vectores" sea claro.
+#    return root
+#
 
 # ── Directorio de usuario (escribible) ───────────────────────────────────────
 
@@ -84,9 +132,9 @@ def user_writable_path(*parts) -> Path:
 
 # ── Recursos empaquetados (solo lectura) ─────────────────────────────────────
 
-def bundled_resource_path(*parts) -> Path:
-    """Ruta a un recurso que viene con la instalación (assets, config por defecto, etc.)."""
-    return app_install_dir().joinpath(*parts)
+#def bundled_resource_path(*parts) -> Path:
+#    """Ruta a un recurso que viene con la instalación (assets, config por defecto, etc.)."""
+#    return app_install_dir().joinpath(*parts)
 
 
 def bundled_icon_path() -> Path | None:
@@ -95,9 +143,9 @@ def bundled_icon_path() -> Path | None:
     Devuelve la primera que exista, o None si no se encuentra ninguna.
     """
     candidates = [
-        bundled_resource_path("assets", "Ratmaster_logo.ico"),
-        bundled_resource_path("assets", "Ratmaster_logo.png"),
-        bundled_resource_path("Ratmaster_logo.png"),
+        bundled_resource_path("assets", "logo_bnct.ico"),
+        bundled_resource_path("assets", "logo_bnct.png"),
+        bundled_resource_path("logo_bnct.png"),
     ]
     for p in candidates:
         try:

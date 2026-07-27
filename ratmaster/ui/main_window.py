@@ -28,13 +28,14 @@ from ratmaster.app_paths import (
 )
 from ratmaster.constants import (
     ORG_ORDER, FLUX_CORR_FACTOR, ORGAN_COLORS,
-    PROTO_LIB, CBE_PRESET, RBE_PRESET,
+    PROTO_LIB, BIO_LIB, DEFAULT_BIO_PRESET_NAME,
     CONSTRAINT_PRESETS,
-    USER_BORO_PROTOCOLS, USER_CONSTRAINT_PRESETS, USER_ISOE_PRESETS,
+    USER_BORO_PROTOCOLS, USER_CONSTRAINT_PRESETS, USER_ISOE_PRESETS, USER_BIO_PRESETS,
     _defaults_from_libs, _make_constraints_matrix,
     _resolve_boro_protocol_name, _is_builtin_boro_protocol,
-    _is_builtin_isoe_preset, _is_builtin_constraint_preset,
+    _is_builtin_isoe_preset, _is_builtin_constraint_preset, _is_builtin_bio_preset,
     _constraints_matrix_from_serializable, _sanitize_boro_protocol_dict,
+    _constraints_matrix_to_dict,
 )
 from ratmaster.data.vector_loader import load_vectordose, _safe_set_name
 from ratmaster.data.persistence import load_spnd_registry, save_spnd_registry, parse_number_or_pair
@@ -50,7 +51,7 @@ from ratmaster.physics.isoe import (
     auto_assign_presets, build_params_by_organ, detect_tissue_type,
 )
 from ratmaster.ui.formatters import (
-    format_value_uncertainty, format_scientific_value_uncertainty,
+    format_value_uncertainty, format_scientific_value_uncertainty, format_time, parse_time_input,
     dose_type_display, dose_axis_unit,
 )
 from ratmaster.ui.canvas import MplCanvas
@@ -67,7 +68,7 @@ class BNCTMain(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Ratmaster")
-        self.setMinimumSize(1200, 750)
+        self.setMinimumSize(980, 600)
         try:
             icon_path = bundled_icon_path()
             if icon_path is not None:
@@ -106,6 +107,15 @@ class BNCTMain(QtWidgets.QMainWindow):
         self.vectors = {}   # organ -> (B,F,T,G)
         self.B_arr = None; self.B_err = None; self.CBE = None; self.RBE = None; self.Constraints = None
         self.active_boro_protocol_name = "BPA46.5"
+        # Preset de parámetros biológicos (CBE/RBE) activo — ver BIO_LIB en
+        # constants.py y ui/dialogs/bio_params.py.
+        self.active_bio_preset_name = DEFAULT_BIO_PRESET_NAME
+        # Origen de la concentración de boro: "generico" (valores del protocolo
+        # tal cual) o "sangre" (calculada a partir de una medición en sangre y
+        # la relación Tejido/Sangre del protocolo). Ver ui/dialogs/boro.py.
+        self.boro_source_mode = "generico"
+        self.boro_blood_conc = None
+        self.boro_blood_conc_err = None
 
         # resultados
         self.report = None; self.dsum = None; self.deq = None
@@ -325,8 +335,36 @@ class BNCTMain(QtWidgets.QMainWindow):
 
         self.input_time = QtWidgets.QLineEdit("0.0")
         self.input_time_err = QtWidgets.QLineEdit("0.0")
+        self._time_input_fmt = "s"   # "s" o "ms" — controla cómo se interpreta input_time.text()
 
-        lay_tfix.addRow("Tiempo (s):", self.input_time)
+        self.cmb_time_input_fmt = QtWidgets.QComboBox()
+        self.cmb_time_input_fmt.addItem("segundos", "s")
+        self.cmb_time_input_fmt.addItem("min + seg", "ms")
+        self.cmb_time_input_fmt.setToolTip(
+            "Formato para ingresar el tiempo: segundos puros (ej. 612) "
+            "o minutos y segundos (ej. 10m 12s)"
+        )
+
+        time_input_row = QtWidgets.QWidget()
+        time_input_row_lay = QtWidgets.QHBoxLayout(time_input_row)
+        time_input_row_lay.setContentsMargins(0, 0, 0, 0)
+        time_input_row_lay.addWidget(self.input_time)
+        time_input_row_lay.addWidget(self.cmb_time_input_fmt)
+
+        self.lbl_time_row = QtWidgets.QLabel("Tiempo (s):")
+
+        def _on_time_input_fmt_changed():
+            self._time_input_fmt = self.cmb_time_input_fmt.currentData()
+            if self._time_input_fmt == "ms":
+                self.lbl_time_row.setText("Tiempo (min+seg):")
+                self.input_time.setPlaceholderText("ej: 10m 12s")
+            else:
+                self.lbl_time_row.setText("Tiempo (s):")
+                self.input_time.setPlaceholderText("ej: 612")
+
+        self.cmb_time_input_fmt.currentIndexChanged.connect(_on_time_input_fmt_changed)
+
+        lay_tfix.addRow(self.lbl_time_row, time_input_row)
         lay_tfix.addRow("Incertidumbre Tiempo (s):", self.input_time_err)
 
         leftlay.addWidget(self.box_time)
@@ -485,7 +523,8 @@ QListWidget::indicator:checked {
         splitter.addWidget(right)
 
     def open_bio_dialog(self):
-        dlg = BioParamsDialog(self, self.tbl_cbe, self.tbl_rbe)
+        dlg = BioParamsDialog(self, self.tbl_cbe, self.tbl_rbe,
+                               current_name=getattr(self, "active_bio_preset_name", "") or DEFAULT_BIO_PRESET_NAME)
         if dlg.exec():
             # Copiar valores de vuelta a las tablas principales
             for j in range(self.tbl_cbe.columnCount()):
@@ -497,10 +536,21 @@ QListWidget::indicator:checked {
                 item = dlg.tbl_rbe.item(0, j)
                 if item:
                     self.tbl_rbe.setItem(0, j, QtWidgets.QTableWidgetItem(item.text()))
+
+            self.active_bio_preset_name = dlg.selected_preset_name()
+            CBE_list, RBE_list = self._read_cbe_rbe_tables()
+            self.CBE, self.RBE = CBE_list, RBE_list
+            self.read_ui_into_state()
+            self._save_config()
     
     def open_boro_dialog(self):
         current_name = getattr(self, "active_boro_protocol_name", "") or self.combo_proto.currentText()
-        dlg = BoroDialog(self, self.tbl_boro, current_name=current_name)
+        dlg = BoroDialog(
+            self, self.tbl_boro, current_name=current_name,
+            source_mode=getattr(self, "boro_source_mode", "generico"),
+            blood_conc=getattr(self, "boro_blood_conc", None),
+            blood_conc_err=getattr(self, "boro_blood_conc_err", None),
+        )
         if dlg.exec():
             for i in range(2):
                 for j in range(len(ORG_ORDER)):
@@ -512,13 +562,24 @@ QListWidget::indicator:checked {
                 self.active_boro_protocol_name = selected
             else:
                 self.active_boro_protocol_name = "(manual)"
+            # Origen de la concentración: genérico, o a partir de sangre (y en
+            # ese caso, con qué concentración/error se calculó cada órgano).
+            self.boro_source_mode = dlg.selected_source_mode()
+            blood_conc, blood_err = dlg.blood_concentration()
+            self.boro_blood_conc = blood_conc
+            self.boro_blood_conc_err = blood_err
             self._refresh_proto_combo(selected if selected and selected != "(manual)" else None)
             if selected and selected != "(manual)" and hasattr(self, "combo_proto"):
                 self.combo_proto.setCurrentText(selected)
             self._update_active_protocol_label()
             self.read_ui_into_state()
             self._save_config()
-            self.status.setText(f"Protocolo de boro activo: {self.active_boro_protocol_name if self.active_boro_protocol_name != '(manual)' else 'manual.'}")
+            origen_txt = ("a partir de sangre" if self.boro_source_mode == "sangre" else "genérico")
+            self.status.setText(
+                f"Protocolo de boro activo: "
+                f"{self.active_boro_protocol_name if self.active_boro_protocol_name != '(manual)' else 'manual.'} "
+                f"({origen_txt})"
+            )
     
 
     # ---------- SPND: flujo desde corrientes ----------
@@ -634,11 +695,15 @@ QListWidget::indicator:checked {
     # ---------- carga defaults y vectores ----------
     def load_defaults(self):
         proto_name = self.combo_proto.currentText() if hasattr(self, "combo_proto") else "BPA46.5"
-        lib = _defaults_from_libs(proto_name)
+        self.active_bio_preset_name = DEFAULT_BIO_PRESET_NAME
+        lib = _defaults_from_libs(proto_name, bio_name=self.active_bio_preset_name)
         self.B_arr = lib["B_arr"]; self.B_err = lib["B_err"]
         self.CBE   = lib["CBE"];   self.RBE   = lib["RBE"]
 
         self.active_boro_protocol_name = proto_name
+        self.boro_source_mode = "generico"
+        self.boro_blood_conc = None
+        self.boro_blood_conc_err = None
         self.populate_boro_rbe_cbe_tables()
         self.populate_constraints_table()
         self.reload_vectors()
@@ -657,10 +722,17 @@ QListWidget::indicator:checked {
             return
         try:
             self.read_ui_into_state()
-            lib = _defaults_from_libs(name)
+            lib = _defaults_from_libs(name, bio_name=getattr(self, "active_bio_preset_name", DEFAULT_BIO_PRESET_NAME))
             self.B_arr = lib["B_arr"]; self.B_err = lib["B_err"]
             self.CBE   = lib["CBE"];   self.RBE   = lib["RBE"]
             self.active_boro_protocol_name = name
+            # Elegir un protocolo de boro directamente desde el combo carga
+            # siempre sus valores genéricos de boro; el preset de CBE/RBE
+            # activo NO se toca (son independientes — se cambia desde
+            # "Parámetros biológicos (CBE / RBE)…", ver BioParamsDialog).
+            self.boro_source_mode = "generico"
+            self.boro_blood_conc = None
+            self.boro_blood_conc_err = None
             self.populate_boro_rbe_cbe_tables()
             self.read_ui_into_state()
             self._update_active_protocol_label()
@@ -776,7 +848,10 @@ QListWidget::indicator:checked {
             "dose_type_index": int(self.combo_type.currentIndex()),
             "spnd": self._safe_float_from_text(self.input_spnd.text(), 0.0),
             "spnd_err_input": self._safe_float_from_text(self.input_spnd_err.text(), 0.0),
-            "time": self._safe_float_from_text(self.input_time.text(), 0.0),
+            # [FIX] Antes: self._safe_float_from_text(self.input_time.text(), 0.0)
+            # solo entendía un número simple. Ahora respeta el formato elegido
+            # en self.cmb_time_input_fmt ("s" o "ms" = minutos+segundos).
+            "time": (parse_time_input(self.input_time.text(), self._time_input_fmt) or 0.0),
             "time_err": self._safe_float_from_text(self.input_time_err.text(), 0.0),
             "sys_err": self._safe_float_from_text(self.input_sys.text(), 0.0),
             "B": B_list,
@@ -789,6 +864,12 @@ QListWidget::indicator:checked {
             "isoe_t0_map_by_organ": t0_map_by_organ,   # {organ: t0_map}
             "isoe_organ_assignment": dict(self.isoe_organ_assignment or {}),
             "boro_protocol_name": getattr(self, "active_boro_protocol_name", "") or (self.combo_proto.currentText() if hasattr(self, "combo_proto") else ""),
+            # Origen de la concentración de boro usada ("generico" o "sangre")
+            # y, si vino de sangre, con qué concentración/error se calculó
+            # cada órgano — se reporta tal cual en el reporte de resultados.
+            "boro_source_mode": getattr(self, "boro_source_mode", "generico"),
+            "boro_blood_conc": getattr(self, "boro_blood_conc", None),
+            "boro_blood_conc_err": getattr(self, "boro_blood_conc_err", None),
         }
         return self.state
 
@@ -949,13 +1030,23 @@ QListWidget::indicator:checked {
     def _save_config(self):
         try:
             custom_boro = {k: PROTO_LIB[k] for k in PROTO_LIB.keys() if not _is_builtin_boro_protocol(k)}
-            custom_cons = {k: np.array(v, dtype=float).tolist() for k, v in CONSTRAINT_PRESETS.items() if not _is_builtin_constraint_preset(k)}
+            # [FIX] Antes: np.array(v).tolist() -> formato posicional viejo,
+            # vulnerable a desalinearse si después se agrega/quita un órgano
+            # de ORG_ORDER. Ahora se serializa por nombre de órgano, igual
+            # que save_user_constraint_presets() en data/persistence.py.
+            custom_cons = {
+                k: _constraints_matrix_to_dict(v, ORG_ORDER)
+                for k, v in CONSTRAINT_PRESETS.items()
+                if not _is_builtin_constraint_preset(k)
+            }
             custom_isoe = {k: v for k, v in USER_ISOE_PRESETS.items() if not _is_builtin_isoe_preset(k)}
+            custom_bio = {k: BIO_LIB[k] for k in BIO_LIB.keys() if not _is_builtin_bio_preset(k)}
             cfg = {
                 "active_vector_set": self.active_vector_set,
                 "custom_boro_protocols": custom_boro,
                 "custom_constraint_presets": custom_cons,
                 "custom_isoe_presets": custom_isoe,
+                "custom_bio_presets": custom_bio,
             }
             self.config_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception:
@@ -1389,6 +1480,13 @@ QListWidget::indicator:checked {
         # No sobreescribir aquí (evita inconsistencia entre lo que ven las
         # varianzas de dosis y lo que muestra el reporte).
         report["meta"]["boro_protocol_name"] = _resolve_boro_protocol_name(st.get("boro_protocol_name") or getattr(self, "active_boro_protocol_name", "") or (self.combo_proto.currentText() if hasattr(self, "combo_proto") else "Manual"))
+        # Origen de la concentración de boro: "generico" (valores del
+        # protocolo) o "sangre" (calculada a partir de una medición en sangre
+        # y la relación Tejido/Sangre del protocolo). Si es "sangre", se
+        # reporta también la concentración y el error usados.
+        report["meta"]["boro_source_mode"] = st.get("boro_source_mode", getattr(self, "boro_source_mode", "generico"))
+        report["meta"]["boro_blood_conc"] = st.get("boro_blood_conc", getattr(self, "boro_blood_conc", None))
+        report["meta"]["boro_blood_conc_err"] = st.get("boro_blood_conc_err", getattr(self, "boro_blood_conc_err", None))
         report["meta"]["dose_mode_text"] = dose_mode_text
         if mode_constraints:
             report["meta"]["constraints_used"] = summarize_constraints_matrix(cons, ORG_ORDER)
@@ -1471,7 +1569,7 @@ QListWidget::indicator:checked {
                 msg.setWindowTitle("Tiempo óptimo (Restricciones de dosis)")
                 msg.setIcon(QtWidgets.QMessageBox.Information)
                 msg.setText(
-                    f"<h1>Tiempo usado para el cálculo: {format_value_uncertainty(t, t_sigma, 's')}</h1>"
+                    f"<h1>Tiempo usado para el cálculo: {format_time(t, t_sigma, 's')}</h1>"
                     f"<p><b>Órgano / restricción limitante:</b> {org}</p>"
                     f"<p><b>Tipo:</b> {typ} &nbsp;&nbsp; <b>Límite:</b> {lim} {dose_axis_unit(self.use_bio_mode, self.use_isoe_mode)}</p>"
                     f"<p><b>Valor logrado:</b> {ach:.3f} {dose_axis_unit(self.use_bio_mode, self.use_isoe_mode)}</p>"
@@ -1522,7 +1620,7 @@ QListWidget::indicator:checked {
         if self.use_isoe_mode and mode_constraints and "meta" in report and report["meta"].get("chosen_constraint"):
             ch = report["meta"]["chosen_constraint"]
             self.status.setText(
-                f"IsoE constraints — t={format_value_uncertainty(report.get('meta',{}).get('time',0), report.get('meta',{}).get('time_err',0), 's')} — "
+                f"IsoE constraints — t={format_time(report.get('meta',{}).get('time',0), report.get('meta',{}).get('time_err',0), 's')} — "
                 f"{ch.get('org')} / {ch.get('type')} ≤ {ch.get('limit_value')} {dose_axis_unit(self.use_bio_mode, self.use_isoe_mode)} "
                 f"(preset IsoE: {report.get('meta',{}).get('isoe_preset_name','Manual')})"
             )

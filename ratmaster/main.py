@@ -66,8 +66,8 @@ def main() -> None:
 
     # ── 4. SplashScreen ───────────────────────────────────────────────────────
     splash_candidates = [
-        bundled_resource_path('assets', 'Ratmaster_logo.png'),
-        bundled_resource_path('Ratmaster_logo.png'),
+        bundled_resource_path('assets', 'logo_bnct.png'),
+        bundled_resource_path('logo_bnct.png'),
     ]
     splash_path = next((p for p in splash_candidates if p.exists()), None)
 
